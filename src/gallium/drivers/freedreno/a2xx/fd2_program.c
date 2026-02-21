@@ -192,9 +192,21 @@ fd2_program_emit(struct fd_context *ctx, struct fd_ringbuffer *ring,
       emit(ring, MESA_SHADER_FRAGMENT, fpi, NULL);
       fs_gprs = (fpi->max_reg < 0) ? 0x80 : fpi->max_reg;
       vs_export = MAX2(1, f->inputs_count) - 1;
+
+      /* Debug: warn if fragment shader has no registers allocated */
+      if (fpi->max_reg < 0) {
+         mesa_logw("A2XX: FS max_reg=-1 (using 0x80), sizedwords=%u, inputs=%u",
+                   fpi->sizedwords, f->inputs_count);
+      }
    }
 
    vs_gprs = (vpi->max_reg < 0) ? 0x80 : vpi->max_reg;
+
+   /* Debug: warn if vertex shader has no registers allocated */
+   if (vpi->max_reg < 0) {
+      mesa_logw("A2XX: VS max_reg=-1 (using 0x80), sizedwords=%u",
+                vpi->sizedwords);
+   }
 
    if (vp->writes_psize && !binning)
       mode = POSITION_2_VECTORS_SPRITE;
@@ -220,6 +232,15 @@ fd2_program_emit(struct fd_context *ctx, struct fd_ringbuffer *ring,
                A2XX_SQ_PROGRAM_CNTL_VS_REGS(vs_gprs) |
                COND(fp && fp->need_param, A2XX_SQ_PROGRAM_CNTL_PARAM_GEN) |
                COND(!fp, A2XX_SQ_PROGRAM_CNTL_GEN_INDEX_VTX));
+
+   /* Debug: log shader program state for interpolation debugging */
+   if (FD_DBG(MSGS)) {
+      mesa_logi("A2XX: SQ_PROGRAM_CNTL: vs_gprs=0x%02x(%d) fs_gprs=0x%02x(%d) "
+                "vs_export=%u inputs=%u vs_sizedw=%u fs_sizedw=%u",
+                vs_gprs, vpi->max_reg, fs_gprs, fp ? fpi->max_reg : -1,
+                vs_export, fp ? f->inputs_count : 0,
+                vpi->sizedwords, fp ? fpi->sizedwords : 0);
+   }
 }
 
 void

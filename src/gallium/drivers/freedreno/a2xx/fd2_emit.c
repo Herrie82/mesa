@@ -389,6 +389,15 @@ fd2_emit_state(struct fd_context *ctx, const enum fd_dirty_3d_state dirty)
 void
 fd2_emit_restore(struct fd_context *ctx, struct fd_ringbuffer *ring)
 {
+   /* Debug: Log when GPU state restore is called. This helps track whether
+    * GPU initialization is happening consistently across batches.
+    */
+   if (FD_DBG(MSGS)) {
+      static uint32_t restore_count = 0;
+      mesa_logi("A2XX: fd2_emit_restore called (count=%u, is_a20x=%d)",
+                ++restore_count, is_a20x(ctx->screen));
+   }
+
    if (is_a20x(ctx->screen)) {
       OUT_PKT0(ring, REG_A2XX_RB_BC_CONTROL, 1);
       OUT_RING(ring, A2XX_RB_BC_CONTROL_ACCUM_TIMEOUT_SELECT(3) |
@@ -457,6 +466,14 @@ fd2_emit_restore(struct fd_context *ctx, struct fd_ringbuffer *ring)
    OUT_RING(ring, CP_REG(REG_A2XX_SQ_INTERPOLATOR_CNTL));
    OUT_RING(ring, 0xffffffff);
 
+   /* Debug: Log interpolator control value. This register controls how
+    * varying inputs are interpolated (smooth vs flat shading). 0xffffffff
+    * means all varyings use smooth interpolation.
+    */
+   if (FD_DBG(MSGS)) {
+      mesa_logi("A2XX: SQ_INTERPOLATOR_CNTL=0xffffffff (all smooth)");
+   }
+
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
    OUT_RING(ring, CP_REG(REG_A2XX_PA_SC_AA_CONFIG));
    OUT_RING(ring, 0x00000000);
@@ -504,8 +521,32 @@ fd2_emit_restore(struct fd_context *ctx, struct fd_ringbuffer *ring)
    OUT_RING(ring, 0x5f601000);
    OUT_RING(ring, 0x00000001);
 
+   /* A22X: Initialize SQ_GPR_MANAGEMENT to allocate 64 GPRs each for vertex
+    * and pixel shaders. KGSL initializes this to 0x00040400. Without proper
+    * initialization, a random value from GPU power-on could starve one
+    * shader type of GPRs, causing intermittent varying interpolation issues
+    * (e.g., faceted shading when smooth shading is expected).
+    *
+    * Register layout (0x0d00):
+    *   REG_DYNAMIC (bit 0): 0 = static allocation
+    *   REG_SIZE_PIX (bits 4-11): 0x40 = 64 GPRs for pixel shader
+    *   REG_SIZE_VTX (bits 12-19): 0x40 = 64 GPRs for vertex shader
+    */
+   OUT_PKT0(ring, REG_A2XX_SQ_GPR_MANAGEMENT, 1);
+   OUT_RING(ring, 0x00040400);
+
+   /* Debug: Log GPR management setup. This is critical for shader execution. */
+   if (FD_DBG(MSGS)) {
+      mesa_logi("A2XX: SQ_GPR_MANAGEMENT=0x00040400 (VS=64, PS=64 GPRs)");
+   }
+
    OUT_PKT0(ring, REG_A2XX_SQ_INST_STORE_MANAGMENT, 1);
    OUT_RING(ring, 0x00000180);
+
+   /* Debug: Log instruction store management. */
+   if (FD_DBG(MSGS)) {
+      mesa_logi("A2XX: SQ_INST_STORE_MANAGMENT=0x00000180");
+   }
 
    OUT_PKT3(ring, CP_INVALIDATE_STATE, 1);
    OUT_RING(ring, 0x00000300);
