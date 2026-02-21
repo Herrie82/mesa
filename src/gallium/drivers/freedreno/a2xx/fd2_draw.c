@@ -133,6 +133,8 @@ draw_impl(struct fd_context *ctx, const struct pipe_draw_info *info,
       /* not sure why this is required, but it fixes some hangs */
       OUT_WFI(ring);
    } else {
+      /* A22X: also need WFI to prevent state corruption between draws */
+      OUT_WFI(ring);
       OUT_PKT3(ring, CP_SET_CONSTANT, 2);
       OUT_RING(ring, CP_REG(REG_A2XX_UNKNOWN_2010));
       OUT_RING(ring, 0x00000000);
