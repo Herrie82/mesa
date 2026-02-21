@@ -157,6 +157,15 @@ fd2_draw_vbo(struct fd_context *ctx, const struct pipe_draw_info *pinfo,
        !u_trim_pipe_prim(pinfo->mode, (unsigned *)&pdraw->count))
       return false;
 
+   /* Debug: log draw state for comparison between good/bad runs */
+   if (FD_DBG(MSGS)) {
+      static unsigned draw_num = 0;
+      draw_num++;
+      mesa_logi("DRAW[%u]: mode=%u count=%u start=%u dirty=0x%x vs=%p fs=%p",
+                draw_num, pinfo->mode, pdraw->count, pdraw->start,
+                ctx->dirty, ctx->prog.vs, ctx->prog.fs);
+   }
+
    if (ctx->dirty & FD_DIRTY_VTXBUF)
       emit_vertexbufs(ctx);
 

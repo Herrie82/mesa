@@ -113,6 +113,14 @@ emit_texture(struct fd_ringbuffer *ring, struct fd_context *ctx,
 
    rsc = view->base.texture ? fd_resource(view->base.texture) : NULL;
 
+   /* Debug: log texture state */
+   if (FD_DBG(MSGS) && rsc) {
+      mesa_logi("  TEX[%u]: const=%u fmt=%u %ux%u gpu=0x%llx tex0=0x%08x",
+                samp_id, const_idx, view->base.format,
+                view->base.texture->width0, view->base.texture->height0,
+                (unsigned long long)fd_bo_get_iova(rsc->bo), view->tex0);
+   }
+
    OUT_PKT3(ring, CP_SET_CONSTANT, 7);
    OUT_RING(ring, 0x00010000 + (0x6 * const_idx));
 
