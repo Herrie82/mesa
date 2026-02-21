@@ -35,13 +35,16 @@ fd2_shader_state_delete(struct pipe_context *pctx, void *hwcso)
    free(so);
 }
 
-static void
+static bool
 emit(struct fd_ringbuffer *ring, mesa_shader_stage type,
      struct ir2_shader_info *info, struct util_dynarray *patches)
 {
    unsigned i;
 
-   assert(info->sizedwords);
+   if (!info->sizedwords) {
+      mesa_loge("fd2: shader has no instructions");
+      return false;
+   }
 
    OUT_PKT3(ring, CP_IM_LOAD_IMMEDIATE, 2 + info->sizedwords);
    OUT_RING(ring, type == MESA_SHADER_FRAGMENT);
@@ -53,6 +56,7 @@ emit(struct fd_ringbuffer *ring, mesa_shader_stage type,
 
    for (i = 0; i < info->sizedwords; i++)
       OUT_RING(ring, info->dwords[i]);
+   return true;
 }
 
 static int
@@ -83,7 +87,8 @@ fd2_shader_state_create(struct pipe_context *pctx,
 
    so->first_immediate = so->nir->num_uniforms;
 
-   ir2_compile(so, 0, NULL);
+   if (!ir2_compile(so, 0, NULL))
+      goto fail;
 
    /* Free FS NIR now.  VS NIR will need to stick around for the draw variant
     * later.
