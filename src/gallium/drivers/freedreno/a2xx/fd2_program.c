@@ -233,6 +233,16 @@ fd2_program_emit(struct fd_context *ctx, struct fd_ringbuffer *ring,
                COND(fp && fp->need_param, A2XX_SQ_PROGRAM_CNTL_PARAM_GEN) |
                COND(!fp, A2XX_SQ_PROGRAM_CNTL_GEN_INDEX_VTX));
 
+   /* Set SQ_INTERPOLATOR_CNTL AFTER SQ_PROGRAM_CNTL.
+    * This register controls whether each varying uses smooth or flat
+    * interpolation. 0xffffffff = all varyings use smooth interpolation.
+    * Hardware may require this ordering for proper interpolation setup.
+    * Also set in fd2_emit_restore() for baseline init.
+    */
+   OUT_PKT3(ring, CP_SET_CONSTANT, 2);
+   OUT_RING(ring, CP_REG(REG_A2XX_SQ_INTERPOLATOR_CNTL));
+   OUT_RING(ring, 0xffffffff);
+
    /* Debug: log shader program state for interpolation debugging */
    if (FD_DBG(MSGS)) {
       mesa_logi("A2XX: SQ_PROGRAM_CNTL: vs_gprs=0x%02x(%d) fs_gprs=0x%02x(%d) "
