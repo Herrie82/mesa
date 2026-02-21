@@ -110,7 +110,7 @@ insert(struct ir2_context *ctx, unsigned block_idx, unsigned reg_idx,
          break;
 
       mask &= mr;
-      if (s->instr_s || s->instr->src_count == 3)
+      if (s->instr_s || !s->instr || s->instr->src_count == 3)
          continue;
 
       if (s->instr->type != IR2_ALU || s->instr->alu.export >= 0)
@@ -274,7 +274,10 @@ sched_next(struct ir2_context *ctx, struct ir2_sched_instr *sched)
    }
 
    if (!avail_count) {
-      assert(block_idx == -1);
+      if (block_idx != -1) {
+         mesa_loge("ir2: no instruction available in sched_next, aborting");
+         return -2;
+      }
       return -1;
    }
 
@@ -321,7 +324,10 @@ sched_next(struct ir2_context *ctx, struct ir2_sched_instr *sched)
       }
    }
 
-   assert(instr_v || instr_s);
+   if (!instr_v && !instr_s) {
+      mesa_loge("ir2: scheduler failed to find valid instruction");
+      return -2;
+   }
 
    /* now, we try more complex insertion of vector instruction as scalar
     * TODO: if we are smart we can still insert if instr_v->src_count==3
@@ -371,7 +377,7 @@ sched_next(struct ir2_context *ctx, struct ir2_sched_instr *sched)
 }
 
 /* scheduling: determine order of instructions */
-static void
+static bool
 schedule_instrs(struct ir2_context *ctx)
 {
    struct ir2_sched_instr *sched;
@@ -383,8 +389,14 @@ schedule_instrs(struct ir2_context *ctx)
          ra_reg(ctx, &ctx->input[idx], idx, false, 0);
 
    for (;;) {
+      if (ctx->instr_sched_count >= ARRAY_SIZE(ctx->instr_sched)) {
+         mesa_loge("ir2: too many scheduled instructions");
+         return false;
+      }
       sched = &ctx->instr_sched[ctx->instr_sched_count++];
       block_idx = sched_next(ctx, sched);
+      if (block_idx == -2)
+         return false;
       if (block_idx < 0)
          break;
       memcpy(sched->reg_state, ctx->reg_state, sizeof(ctx->reg_state));
@@ -417,9 +429,10 @@ schedule_instrs(struct ir2_context *ctx)
          ra_block_free(ctx, block_idx);
    };
    ctx->instr_sched_count--;
+   return true;
 }
 
-void
+bool
 ir2_compile(struct fd2_shader_stateobj *so, unsigned variant,
             struct fd2_shader_stateobj *fp)
 {
@@ -447,8 +460,10 @@ ir2_compile(struct fd2_shader_stateobj *so, unsigned variant,
    cp_export(&ctx);
 
    /* instruction order.. and vector->scalar conversions */
-   schedule_instrs(&ctx);
+   if (!schedule_instrs(&ctx))
+      return false;
 
    /* finally, assemble to bitcode */
    assemble(&ctx, binning);
+   return true;
 }

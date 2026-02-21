@@ -65,7 +65,7 @@ struct ir2_shader_variant {
 struct fd2_shader_stateobj;
 struct tgsi_token;
 
-void ir2_compile(struct fd2_shader_stateobj *so, unsigned variant,
+bool ir2_compile(struct fd2_shader_stateobj *so, unsigned variant,
                  struct fd2_shader_stateobj *fp);
 
 struct nir_shader *ir2_tgsi_to_nir(const struct tgsi_token *tokens,
