@@ -93,5 +93,13 @@ fd2_blend_state_create(struct pipe_context *pctx,
    if (cso->dither)
       so->rb_colorcontrol |= A2XX_RB_COLORCONTROL_DITHER_MODE(DITHER_ALWAYS);
 
+   /* Debug: log blend state creation */
+   if (rt->blend_enable) {
+      mesa_logi("A2XX blend: rgb_src=%d rgb_dst=%d rgb_func=%d alpha_src=%d alpha_dst=%d alpha_func=%d rb_blendcontrol=0x%08x",
+                rt->rgb_src_factor, rt->rgb_dst_factor, rt->rgb_func,
+                rt->alpha_src_factor, rt->alpha_dst_factor, rt->alpha_func,
+                so->rb_blendcontrol);
+   }
+
    return so;
 }
