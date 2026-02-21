@@ -220,6 +220,13 @@ is_a2xx(struct fd_screen *screen)
    return screen->gen == 2;
 }
 
+/* a22x (Leia): Adreno 220, 225 - different from a20x (Yamato) */
+static inline bool
+is_a22x(struct fd_screen *screen)
+{
+   return (screen->gpu_id >= 220) && (screen->gpu_id < 230);
+}
+
 /* is a3xx patch revision 0? */
 /* TODO a306.0 probably doesn't need this.. be more clever?? */
 static inline bool
