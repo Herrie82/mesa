@@ -163,7 +163,7 @@ struct ir2_context {
    struct ir2_instr instr[0x300];
    unsigned instr_count;
 
-   struct ir2_sched_instr instr_sched[0x180];
+   struct ir2_sched_instr instr_sched[0x400];
    unsigned instr_sched_count;
 };
 
