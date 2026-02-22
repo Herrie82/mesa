@@ -143,6 +143,14 @@ emit_vertexbufs(struct fd_context *ctx) assert_dt
 
    fd2_emit_vertex_bufs(ctx->batch->draw, 0x78, bufs, vtx->num_elements);
    fd2_emit_vertex_bufs(ctx->batch->binning, 0x78, bufs, vtx->num_elements);
+
+   /* A22X workaround: WFI after vertex buffer setup to ensure buffer
+    * addresses are fully registered before vertex fetch begins.
+    */
+   if (is_a22x(ctx->screen)) {
+      OUT_WFI(ctx->batch->draw);
+      OUT_WFI(ctx->batch->binning);
+   }
 }
 
 static void
