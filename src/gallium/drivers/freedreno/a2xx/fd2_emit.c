@@ -361,6 +361,13 @@ fd2_emit_state(struct fd_context *ctx, const enum fd_dirty_3d_state dirty)
       emit_constants(ring, PS_CONST_BASE * 4,
                      &ctx->constbuf[MESA_SHADER_FRAGMENT],
                      (dirty & FD_DIRTY_PROG) ? ctx->prog.fs : NULL);
+
+      /* A22X workaround: WFI after constant emission to ensure shader
+       * constants are fully written before draw. Without this, shaders
+       * may read stale constant values causing incorrect colors.
+       */
+      if (is_a22x(ctx->screen))
+         OUT_WFI(ring);
    }
 
    if (dirty & (FD_DIRTY_BLEND | FD_DIRTY_ZSA)) {
