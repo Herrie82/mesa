@@ -21,6 +21,85 @@
 #include "fd2_util.h"
 #include "fd2_zsa.h"
 
+/* Simple CRC32 for vertex buffer hashing - debug only */
+static uint32_t
+debug_crc32(const void *data, size_t len)
+{
+   const uint8_t *p = data;
+   uint32_t crc = 0xffffffff;
+
+   while (len--) {
+      crc ^= *p++;
+      for (int i = 0; i < 8; i++) {
+         crc = (crc >> 1) ^ (0xedb88320 & -(crc & 1));
+      }
+   }
+   return ~crc;
+}
+
+/* Debug: compute hash of all vertex buffer data */
+static uint32_t
+debug_compute_vb_hash(struct fd_context *ctx, unsigned *out_total_size)
+{
+   struct fd_vertex_stateobj *vtx = ctx->vtx.vtx;
+   struct fd_vertexbuf_stateobj *vertexbuf = &ctx->vtx.vertexbuf;
+   uint32_t combined_hash = 0;
+   unsigned total_size = 0;
+
+   if (!vtx || !vtx->num_elements) {
+      *out_total_size = 0;
+      return 0;
+   }
+
+   for (unsigned i = 0; i < vtx->num_elements; i++) {
+      struct pipe_vertex_element *elem = &vtx->pipe[i];
+      struct pipe_vertex_buffer *vb = &vertexbuf->vb[elem->vertex_buffer_index];
+
+      if (!vb->buffer.resource)
+         continue;
+
+      struct fd_resource *rsc = fd_resource(vb->buffer.resource);
+      if (!rsc || !rsc->bo)
+         continue;
+
+      void *ptr = fd_bo_map(rsc->bo);
+      if (ptr) {
+         unsigned bo_size = fd_bo_size(rsc->bo);
+         /* Hash first 1KB of each buffer */
+         unsigned hash_size = MIN2(bo_size, 1024);
+         unsigned offset = MIN2(vb->buffer_offset, bo_size);
+         unsigned avail = bo_size - offset;
+         uint32_t buf_crc = debug_crc32(ptr + offset, MIN2(hash_size, avail));
+         combined_hash ^= buf_crc;
+         combined_hash = (combined_hash << 5) | (combined_hash >> 27);
+         total_size += bo_size;
+      }
+   }
+
+   *out_total_size = total_size;
+   return combined_hash;
+}
+
+/* Debug: log vertex element details */
+static void
+debug_log_vertex_elements(struct fd_context *ctx, unsigned draw_num)
+{
+   struct fd_vertex_stateobj *vtx = ctx->vtx.vtx;
+   struct fd_vertexbuf_stateobj *vertexbuf = &ctx->vtx.vertexbuf;
+
+   if (!vtx || !vtx->num_elements)
+      return;
+
+   for (unsigned i = 0; i < vtx->num_elements; i++) {
+      struct pipe_vertex_element *elem = &vtx->pipe[i];
+      struct pipe_vertex_buffer *vb = &vertexbuf->vb[elem->vertex_buffer_index];
+      mesa_logi("  DRAW[%u] VTX[%u]: vb_idx=%u buf_off=%u stride=%u fmt=0x%x src_off=%u",
+                draw_num, i, elem->vertex_buffer_index,
+                vb->buffer_offset, elem->src_stride,
+                elem->src_format, elem->src_offset);
+   }
+}
+
 static inline uint32_t
 pack_rgba(enum pipe_format format, const float *rgba)
 {
@@ -150,6 +229,9 @@ fd2_draw_vbo(struct fd_context *ctx, const struct pipe_draw_info *pinfo,
              const struct pipe_draw_start_count_bias *pdraw,
              unsigned index_offset) assert_dt
 {
+   static unsigned global_draw_num = 0;
+   static uint32_t last_vb_hash = 0;
+
    if (!ctx->prog.fs || !ctx->prog.vs)
       return false;
 
@@ -157,13 +239,28 @@ fd2_draw_vbo(struct fd_context *ctx, const struct pipe_draw_info *pinfo,
        !u_trim_pipe_prim(pinfo->mode, (unsigned *)&pdraw->count))
       return false;
 
-   /* Debug: log draw state for comparison between good/bad runs */
+   global_draw_num++;
+
+   /* Comprehensive debug logging for interpolation issue */
    if (FD_DBG(MSGS)) {
-      static unsigned draw_num = 0;
-      draw_num++;
-      mesa_logi("DRAW[%u]: mode=%u count=%u start=%u dirty=0x%x vs=%p fs=%p",
-                draw_num, pinfo->mode, pdraw->count, pdraw->start,
-                ctx->dirty, ctx->prog.vs, ctx->prog.fs);
+      unsigned vb_total_size = 0;
+      uint32_t vb_hash = debug_compute_vb_hash(ctx, &vb_total_size);
+
+      /* Log basic draw info with VB hash */
+      mesa_logi("=== DRAW[%u] === mode=%u count=%u start=%u",
+                global_draw_num, pinfo->mode, pdraw->count, pdraw->start);
+      mesa_logi("  DRAW[%u] dirty=0x%08x vb_hash=0x%08x vb_size=%u",
+                global_draw_num, ctx->dirty, vb_hash, vb_total_size);
+
+      /* Warn if VB hash changed */
+      if (last_vb_hash != 0 && last_vb_hash != vb_hash) {
+         mesa_logi("  DRAW[%u] VB_HASH_CHANGE: 0x%08x -> 0x%08x",
+                   global_draw_num, last_vb_hash, vb_hash);
+      }
+      last_vb_hash = vb_hash;
+
+      /* Log vertex element configuration */
+      debug_log_vertex_elements(ctx, global_draw_num);
    }
 
    if (ctx->dirty & FD_DIRTY_VTXBUF)
