@@ -211,6 +211,14 @@ fd2_program_emit(struct fd_context *ctx, struct fd_ringbuffer *ring,
    if (vp->writes_psize && !binning)
       mode = POSITION_2_VECTORS_SPRITE;
 
+   /* A22X workaround: WFI before shader program setup to ensure GPU is idle.
+    * This helps prevent race conditions where shader registers are read
+    * before they're fully written. Analysis shows Mesa-level state is
+    * identical between smooth and faceted runs, indicating hardware timing.
+    */
+   if (is_a22x(ctx->screen))
+      OUT_WFI(ring);
+
    /* set register to use for param (fragcoord/pointcoord/frontfacing) */
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
    OUT_RING(ring, CP_REG(REG_A2XX_SQ_CONTEXT_MISC));
@@ -233,6 +241,12 @@ fd2_program_emit(struct fd_context *ctx, struct fd_ringbuffer *ring,
                COND(fp && fp->need_param, A2XX_SQ_PROGRAM_CNTL_PARAM_GEN) |
                COND(!fp, A2XX_SQ_PROGRAM_CNTL_GEN_INDEX_VTX));
 
+   /* A22X workaround: WFI to ensure PROGRAM_CNTL is processed before
+    * setting INTERPOLATOR_CNTL.
+    */
+   if (is_a22x(ctx->screen))
+      OUT_WFI(ring);
+
    /* Set SQ_INTERPOLATOR_CNTL AFTER SQ_PROGRAM_CNTL.
     * This register controls whether each varying uses smooth or flat
     * interpolation. 0xffffffff = all varyings use smooth interpolation.
@@ -245,11 +259,39 @@ fd2_program_emit(struct fd_context *ctx, struct fd_ringbuffer *ring,
 
    /* Debug: log shader program state for interpolation debugging */
    if (FD_DBG(MSGS)) {
-      mesa_logi("A2XX: SQ_PROGRAM_CNTL: vs_gprs=0x%02x(%d) fs_gprs=0x%02x(%d) "
-                "vs_export=%u inputs=%u vs_sizedw=%u fs_sizedw=%u",
-                vs_gprs, vpi->max_reg, fs_gprs, fp ? fpi->max_reg : -1,
-                vs_export, fp ? f->inputs_count : 0,
-                vpi->sizedwords, fp ? fpi->sizedwords : 0);
+      static unsigned emit_count = 0;
+      emit_count++;
+
+      uint32_t sq_program_cntl =
+         A2XX_SQ_PROGRAM_CNTL_PS_EXPORT_MODE(2) |
+         A2XX_SQ_PROGRAM_CNTL_VS_EXPORT_MODE(mode) |
+         A2XX_SQ_PROGRAM_CNTL_VS_RESOURCE |
+         A2XX_SQ_PROGRAM_CNTL_PS_RESOURCE |
+         A2XX_SQ_PROGRAM_CNTL_VS_EXPORT_COUNT(vs_export) |
+         A2XX_SQ_PROGRAM_CNTL_PS_REGS(fs_gprs) |
+         A2XX_SQ_PROGRAM_CNTL_VS_REGS(vs_gprs) |
+         COND(fp && fp->need_param, A2XX_SQ_PROGRAM_CNTL_PARAM_GEN) |
+         COND(!fp, A2XX_SQ_PROGRAM_CNTL_GEN_INDEX_VTX);
+
+      mesa_logi("PROG[%u]: SQ_PROGRAM_CNTL=0x%08x mode=%d vs_export=%u",
+                emit_count, sq_program_cntl, mode, vs_export);
+      mesa_logi("PROG[%u]: vs_gprs=%d fs_gprs=%d variant=%u binning=%d",
+                emit_count, vpi->max_reg, fp ? fpi->max_reg : -1,
+                variant, binning ? 1 : 0);
+
+      /* Log fragment shader linkage details */
+      if (fp && f->inputs_count > 0) {
+         mesa_logi("PROG[%u]: FS inputs_count=%u need_param=%d",
+                   emit_count, f->inputs_count, fp->need_param ? 1 : 0);
+         for (unsigned i = 0; i < f->inputs_count && i < 8; i++) {
+            mesa_logi("PROG[%u]:   input[%u] slot=%u",
+                      emit_count, i, f->inputs[i].slot);
+         }
+      }
+
+      /* Log shader sizes to detect if different shaders are used */
+      mesa_logi("PROG[%u]: VS size=%u dwords, FS size=%u dwords",
+                emit_count, vpi->sizedwords, fp ? fpi->sizedwords : 0);
    }
 }
 
