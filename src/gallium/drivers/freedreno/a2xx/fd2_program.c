@@ -257,8 +257,8 @@ fd2_program_emit(struct fd_context *ctx, struct fd_ringbuffer *ring,
    OUT_RING(ring, CP_REG(REG_A2XX_SQ_INTERPOLATOR_CNTL));
    OUT_RING(ring, 0xffffffff);
 
-   /* Debug: log shader program state for interpolation debugging */
-   if (FD_DBG(MSGS)) {
+   /* Debug: always log shader program state for A22X interpolation debugging */
+   if (is_a22x(ctx->screen)) {
       static unsigned emit_count = 0;
       emit_count++;
 
@@ -280,12 +280,13 @@ fd2_program_emit(struct fd_context *ctx, struct fd_ringbuffer *ring,
                 variant, binning ? 1 : 0);
 
       /* Log fragment shader linkage details */
-      if (fp && f->inputs_count > 0) {
-         mesa_logi("PROG[%u]: FS inputs_count=%u need_param=%d",
-                   emit_count, f->inputs_count, fp->need_param ? 1 : 0);
+      if (fp) {
+         mesa_logi("PROG[%u]: FS inputs_count=%u need_param=%d has_kill=%d",
+                   emit_count, f->inputs_count, fp->need_param ? 1 : 0,
+                   fp->has_kill ? 1 : 0);
          for (unsigned i = 0; i < f->inputs_count && i < 8; i++) {
-            mesa_logi("PROG[%u]:   input[%u] slot=%u",
-                      emit_count, i, f->inputs[i].slot);
+            mesa_logi("PROG[%u]:   input[%u] slot=%u ncomp=%u",
+                      emit_count, i, f->inputs[i].slot, f->inputs[i].ncomp);
          }
       }
 
