@@ -189,7 +189,17 @@ draw_impl(struct fd_context *ctx, const struct pipe_draw_info *info,
                 0);
       OUT_RING(ring, 0x00000006);
    } else {
-      OUT_WFI(ring);
+      /* A22X workaround: wait for VGT DMA to complete before draw.
+       * This fixes some intermittent faceted rendering where vertex fetch
+       * may start before DMA writes are complete.
+       * Note: A20x-style dummy draw causes GPU hang on A22X, so we only
+       * use the register poll here.
+       */
+      OUT_PKT3(ring, CP_WAIT_REG_EQ, 4);
+      OUT_RING(ring, 0x000005d0); /* RBBM_STATUS */
+      OUT_RING(ring, 0x00000000);
+      OUT_RING(ring, 0x00001000); /* bit 12: VGT_BUSY_NO_DMA */
+      OUT_RING(ring, 0x00000001);
 
       OUT_PKT3(ring, CP_SET_CONSTANT, 3);
       OUT_RING(ring, CP_REG(REG_A2XX_VGT_MAX_VTX_INDX));
