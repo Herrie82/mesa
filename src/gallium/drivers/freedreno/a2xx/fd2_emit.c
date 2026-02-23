@@ -607,6 +607,41 @@ fd2_emit_restore(struct fd_context *ctx, struct fd_ringbuffer *ring)
                      A2XX_PA_CL_VTE_CNTL_VPORT_Y_OFFSET_ENA |
                      A2XX_PA_CL_VTE_CNTL_VPORT_Z_SCALE_ENA |
                      A2XX_PA_CL_VTE_CNTL_VPORT_Z_OFFSET_ENA);
+
+   /* A22X: Initialize VSC (Visibility Stream Cache) registers.
+    * KGSL saves/restores these during context switches for Leia (A220).
+    * Without initialization, stale values may cause visibility corruption
+    * leading to intermittent rendering issues like faceted shading.
+    *
+    * Registers (from leia_reg.h):
+    *   A220_VSC_BIN_SIZE (0x0C01): Binning size
+    *   VSC_PIPE[0-7] (0x0C06-0x0C1D): 8 pipes, 3 regs each (CONFIG, ADDR, LEN)
+    *   A220_RB_LRZ_VSC_CONTROL (0x2209): LRZ/VSC control
+    */
+   if (is_a22x(ctx->screen)) {
+      /* Initialize A220_RB_LRZ_VSC_CONTROL to 0 (disabled) */
+      OUT_PKT3(ring, CP_SET_CONSTANT, 2);
+      OUT_RING(ring, CP_REG(REG_A2XX_A220_RB_LRZ_VSC_CONTROL));
+      OUT_RING(ring, 0x00000000);
+
+      /* Initialize A220_VSC_BIN_SIZE to 0 */
+      OUT_PKT0(ring, REG_A2XX_A220_VSC_BIN_SIZE, 1);
+      OUT_RING(ring, 0x00000000);
+
+      /* Initialize all 8 VSC_PIPE entries (each has CONFIG, DATA_ADDRESS, DATA_LENGTH)
+       * VSC_PIPE array starts at 0x0c06, stride=3, length=8
+       */
+      for (int i = 0; i < 8; i++) {
+         OUT_PKT0(ring, REG_A2XX_VSC_PIPE_CONFIG(i), 3);
+         OUT_RING(ring, 0x00000000);  /* CONFIG */
+         OUT_RING(ring, 0x00000000);  /* DATA_ADDRESS */
+         OUT_RING(ring, 0x00000000);  /* DATA_LENGTH */
+      }
+
+      if (FD_DBG(MSGS)) {
+         mesa_logi("A22X: VSC registers initialized (VSC_BIN_SIZE=0, LRZ_VSC_CONTROL=0, all pipes=0)");
+      }
+   }
 }
 
 void
