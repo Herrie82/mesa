@@ -109,13 +109,22 @@ pack_rgba(enum pipe_format format, const float *rgba)
 }
 
 static void
-emit_cacheflush(struct fd_ringbuffer *ring)
+emit_cacheflush(struct fd_ringbuffer *ring, bool sync)
 {
    unsigned i;
 
-   for (i = 0; i < 12; i++) {
+   if (sync) {
+      /* A22X: Use synchronous cache flush and invalidate.
+       * CACHE_FLUSH_AND_INV_EVENT (0x16) waits for cache operations to complete,
+       * unlike CACHE_FLUSH (0x06) which is asynchronous.
+       */
       OUT_PKT3(ring, CP_EVENT_WRITE, 1);
-      OUT_RING(ring, CACHE_FLUSH);
+      OUT_RING(ring, CACHE_FLUSH_AND_INV_EVENT);
+   } else {
+      for (i = 0; i < 12; i++) {
+         OUT_PKT3(ring, CP_EVENT_WRITE, 1);
+         OUT_RING(ring, CACHE_FLUSH);
+      }
    }
 }
 
@@ -164,6 +173,12 @@ draw_impl(struct fd_context *ctx, const struct pipe_draw_info *info,
 
    OUT_PKT0(ring, REG_A2XX_TC_CNTL_STATUS, 1);
    OUT_RING(ring, A2XX_TC_CNTL_STATUS_L2_INVALIDATE);
+
+   /* A22X: Wait for L2 cache invalidation to complete before proceeding.
+    * Without this, texture/vertex data may still be stale when fetch begins.
+    */
+   if (is_a22x(ctx->screen))
+      OUT_WFI(ring);
 
    if (is_a20x(ctx->screen)) {
       /* wait for DMA to finish and
@@ -237,7 +252,8 @@ draw_impl(struct fd_context *ctx, const struct pipe_draw_info *info,
       OUT_RING(ring, 0x00000000);
    }
 
-   emit_cacheflush(ring);
+   /* Use synchronous cache flush for A22X to ensure cache coherency */
+   emit_cacheflush(ring, is_a22x(ctx->screen));
 }
 
 static bool
