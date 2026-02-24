@@ -182,6 +182,12 @@ prepare_tile_fini_ib(struct fd_batch *batch) assert_dt
    OUT_RING(ring, fui((float)gmem->bin_h / 2.0f)); /* YSCALE */
    OUT_RING(ring, fui((float)gmem->bin_h / 2.0f)); /* YOFFSET */
 
+   /* A22X: WFI before changing RB_MODECONTROL to ensure pipeline is idle.
+    * Mode transitions between COLOR_DEPTH and EDRAM_COPY require sync.
+    */
+   if (!is_a20x(ctx->screen))
+      OUT_WFI(ring);
+
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
    OUT_RING(ring, CP_REG(REG_A2XX_RB_MODECONTROL));
    OUT_RING(ring, A2XX_RB_MODECONTROL_EDRAM_MODE(EDRAM_COPY));
@@ -191,6 +197,10 @@ prepare_tile_fini_ib(struct fd_batch *batch) assert_dt
 
    if (batch->resolve & FD_BUFFER_COLOR)
       emit_gmem2mem_surf(batch, gmem->cbuf_base[0], &pfb->cbufs[0]);
+
+   /* A22X: WFI before switching back to COLOR_DEPTH mode */
+   if (!is_a20x(ctx->screen))
+      OUT_WFI(ring);
 
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
    OUT_RING(ring, CP_REG(REG_A2XX_RB_MODECONTROL));
@@ -302,6 +312,12 @@ fd2_emit_tile_mem2gmem(struct fd_batch *batch,
    OUT_PKT0(ring, REG_A2XX_TC_CNTL_STATUS, 1);
    OUT_RING(ring, A2XX_TC_CNTL_STATUS_L2_INVALIDATE);
 
+   /* A22X: Wait for L2 cache invalidation to complete before texture fetch.
+    * Without this, stale texture data may be read during mem2gmem blit.
+    */
+   if (!is_a20x(batch->ctx->screen))
+      OUT_WFI(ring);
+
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
    OUT_RING(ring, CP_REG(REG_A2XX_RB_DEPTHCONTROL));
    OUT_RING(ring, A2XX_RB_DEPTHCONTROL_EARLY_Z_ENABLE);
@@ -366,6 +382,14 @@ fd2_emit_tile_mem2gmem(struct fd_batch *batch,
    if (fd_gmem_needs_restore(batch, tile, FD_BUFFER_COLOR))
       emit_mem2gmem_surf(batch, gmem->cbuf_base[0], &pfb->cbufs[0]);
 
+   /* A22X: Cache flush after mem2gmem draws as per blob driver behavior.
+    * This ensures texture data written to GMEM is coherent before rendering.
+    */
+   if (!is_a20x(ctx->screen)) {
+      OUT_PKT3(ring, CP_EVENT_WRITE, 1);
+      OUT_RING(ring, CACHE_FLUSH_AND_INV_EVENT);
+   }
+
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
    OUT_RING(ring, CP_REG(REG_A2XX_PA_CL_VTE_CNTL));
    OUT_RING(ring, A2XX_PA_CL_VTE_CNTL_VTX_W0_FMT |
@@ -375,8 +399,6 @@ fd2_emit_tile_mem2gmem(struct fd_batch *batch,
                      A2XX_PA_CL_VTE_CNTL_VPORT_Y_OFFSET_ENA |
                      A2XX_PA_CL_VTE_CNTL_VPORT_Z_SCALE_ENA |
                      A2XX_PA_CL_VTE_CNTL_VPORT_Z_OFFSET_ENA);
-
-   /* TODO blob driver seems to toss in a CACHE_FLUSH after each DRAW_INDX.. */
 }
 
 static void
