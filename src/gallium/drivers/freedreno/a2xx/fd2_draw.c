@@ -21,6 +21,52 @@
 #include "fd2_util.h"
 #include "fd2_zsa.h"
 
+/* Command stream tracing for A22X faceted shading debug.
+ * Enable with FD_MESA_DEBUG=msgs and FD_A22X_CMDSTREAM=1
+ */
+static bool cmdstream_trace_enabled = false;
+static bool cmdstream_trace_checked = false;
+
+static void
+debug_check_cmdstream_trace(void)
+{
+   if (!cmdstream_trace_checked) {
+      cmdstream_trace_checked = true;
+      const char *env = getenv("FD_A22X_CMDSTREAM");
+      cmdstream_trace_enabled = env && atoi(env) > 0;
+   }
+}
+
+/* Log PM4 packet types for command stream analysis */
+static const char *
+pm4_opcode_name(uint32_t opcode)
+{
+   switch (opcode) {
+   case 0x10: return "CP_NOP";
+   case 0x22: return "CP_DRAW_INDX";
+   case 0x26: return "CP_WAIT_FOR_IDLE";
+   case 0x2d: return "CP_SET_CONSTANT";
+   case 0x36: return "CP_DRAW_INDX_2";
+   case 0x3c: return "CP_WAIT_REG_MEM";
+   case 0x46: return "CP_EVENT_WRITE";
+   case 0x52: return "CP_WAIT_REG_EQ";
+   default: return "UNKNOWN";
+   }
+}
+
+/* Log command stream summary for the current draw */
+static void
+debug_log_cmdstream_summary(struct fd_ringbuffer *ring, unsigned draw_num,
+                            const char *phase)
+{
+   debug_check_cmdstream_trace();
+   if (!cmdstream_trace_enabled)
+      return;
+
+   /* Ring buffer structure varies, just log that we're at this phase */
+   mesa_logi("A22X_CMDSTREAM[%u] %s: ring=%p", draw_num, phase, ring);
+}
+
 /* Simple CRC32 for vertex buffer hashing - debug only */
 static uint32_t
 debug_crc32(const void *data, size_t len)
