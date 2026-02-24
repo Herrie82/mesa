@@ -147,6 +147,15 @@ prepare_tile_fini_ib(struct fd_batch *batch) assert_dt
       OUT_RING(ring, 0x0000028f);
    }
 
+   /* A22X: Set TP0_CHICKEN to 0 during GMEM operations per KGSL behavior.
+    * This may be required for proper texture cache handling during gmem2mem.
+    */
+   if (!is_a20x(ctx->screen)) {
+      OUT_WFI(ring);
+      OUT_PKT0(ring, REG_A2XX_TP0_CHICKEN, 1);
+      OUT_RING(ring, 0x00000000);
+   }
+
    fd2_program_emit(ctx, ring, &ctx->solid_prog);
 
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
@@ -200,6 +209,12 @@ prepare_tile_fini_ib(struct fd_batch *batch) assert_dt
    /* A22X: WFI before switching back to COLOR_DEPTH mode */
    if (!is_a20x(ctx->screen))
       OUT_WFI(ring);
+
+   /* A22X: Restore TP0_CHICKEN to normal value after GMEM operations */
+   if (!is_a20x(ctx->screen)) {
+      OUT_PKT0(ring, REG_A2XX_TP0_CHICKEN, 1);
+      OUT_RING(ring, 0x00000002);
+   }
 
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
    OUT_RING(ring, CP_REG(REG_A2XX_RB_MODECONTROL));
@@ -317,6 +332,14 @@ fd2_emit_tile_mem2gmem(struct fd_batch *batch,
    if (!is_a20x(batch->ctx->screen))
       OUT_WFI(ring);
 
+   /* A22X: Set TP0_CHICKEN to 0 during GMEM operations per KGSL behavior.
+    * This may be required for proper texture cache handling during mem2gmem.
+    */
+   if (!is_a20x(batch->ctx->screen)) {
+      OUT_PKT0(ring, REG_A2XX_TP0_CHICKEN, 1);
+      OUT_RING(ring, 0x00000000);
+   }
+
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
    OUT_RING(ring, CP_REG(REG_A2XX_RB_DEPTHCONTROL));
    OUT_RING(ring, A2XX_RB_DEPTHCONTROL_EARLY_Z_ENABLE);
@@ -386,6 +409,13 @@ fd2_emit_tile_mem2gmem(struct fd_batch *batch,
    if (!is_a20x(ctx->screen)) {
       OUT_PKT3(ring, CP_EVENT_WRITE, 1);
       OUT_RING(ring, CACHE_FLUSH_AND_INV_EVENT);
+   }
+
+   /* A22X: Restore TP0_CHICKEN to normal value after GMEM operations */
+   if (!is_a20x(ctx->screen)) {
+      OUT_WFI(ring);
+      OUT_PKT0(ring, REG_A2XX_TP0_CHICKEN, 1);
+      OUT_RING(ring, 0x00000002);
    }
 
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
