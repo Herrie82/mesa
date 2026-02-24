@@ -238,18 +238,6 @@ draw_impl(struct fd_context *ctx, const struct pipe_draw_info *info,
    if (binning || info->mode == MESA_PRIM_POINTS)
       vismode = IGNORE_VISIBILITY;
 
-   /* A22X: Emit VS_FETCH_DONE event before draw to ensure vertex fetch
-    * has completed and varying data is ready in the parameter cache.
-    * This addresses intermittent faceted rendering where the interpolator
-    * may read stale or incomplete varying data.
-    * VS_FETCH_DONE (0x1b) is defined in KGSL for A2XX.
-    */
-   if (is_a22x(ctx->screen)) {
-      OUT_PKT3(ring, CP_EVENT_WRITE, 1);
-      OUT_RING(ring, 0x1b);  /* VS_FETCH_DONE */
-      OUT_WFI(ring);  /* Wait for event to complete */
-   }
-
    fd_draw_emit(ctx->batch, ring, ctx->screen->primtypes[info->mode],
                 vismode, info, draw, index_offset);
 
