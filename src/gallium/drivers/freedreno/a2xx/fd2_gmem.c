@@ -172,7 +172,8 @@ prepare_tile_fini_ib(struct fd_batch *batch) assert_dt
 
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
    OUT_RING(ring, CP_REG(REG_A2XX_PA_CL_CLIP_CNTL));
-   OUT_RING(ring, 0x00000000);
+   /* A22X: Set CLIP_DISABLE during GMEM operations per KGSL behavior */
+   OUT_RING(ring, is_a20x(ctx->screen) ? 0x00000000 : 0x00010000);
 
    OUT_PKT3(ring, CP_SET_CONSTANT, 5);
    OUT_RING(ring, CP_REG(REG_A2XX_PA_CL_VPORT_XSCALE));
@@ -356,7 +357,8 @@ fd2_emit_tile_mem2gmem(struct fd_batch *batch,
 
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
    OUT_RING(ring, CP_REG(REG_A2XX_PA_CL_CLIP_CNTL));
-   OUT_RING(ring, 0x00000000);
+   /* A22X: Set CLIP_DISABLE during GMEM operations per KGSL behavior */
+   OUT_RING(ring, is_a20x(batch->ctx->screen) ? 0x00000000 : 0x00010000);
 
    if (fd_gmem_needs_restore(batch, tile, FD_BUFFER_DEPTH | FD_BUFFER_STENCIL))
       emit_mem2gmem_surf(batch, gmem->zsbuf_base[0], &pfb->zsbuf);
