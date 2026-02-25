@@ -182,6 +182,16 @@ prepare_tile_fini_ib(struct fd_batch *batch) assert_dt
    OUT_RING(ring, fui((float)gmem->bin_h / 2.0f)); /* YSCALE */
    OUT_RING(ring, fui((float)gmem->bin_h / 2.0f)); /* YOFFSET */
 
+   /* A22X: Disable LRZ/VSC during GMEM copy operations per KGSL behavior.
+    * This ensures the Low Resolution Z and Visibility Stream Cache don't
+    * interfere with the GMEM blit operations.
+    */
+   if (!is_a20x(ctx->screen)) {
+      OUT_PKT3(ring, CP_SET_CONSTANT, 2);
+      OUT_RING(ring, CP_REG(REG_A2XX_A220_RB_LRZ_VSC_CONTROL));
+      OUT_RING(ring, 0);
+   }
+
    /* A22X: WFI before changing RB_MODECONTROL to ensure pipeline is idle.
     * Mode transitions between COLOR_DEPTH and EDRAM_COPY require sync.
     */
@@ -306,6 +316,16 @@ fd2_emit_tile_mem2gmem(struct fd_batch *batch,
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
    OUT_RING(ring, CP_REG(REG_A2XX_VGT_INDX_OFFSET));
    OUT_RING(ring, 0);
+
+   /* A22X: Disable LRZ/VSC during mem2gmem blit per KGSL behavior.
+    * This ensures the Low Resolution Z and Visibility Stream Cache don't
+    * interfere with the texture restore blit operations.
+    */
+   if (!is_a20x(ctx->screen)) {
+      OUT_PKT3(ring, CP_SET_CONSTANT, 2);
+      OUT_RING(ring, CP_REG(REG_A2XX_A220_RB_LRZ_VSC_CONTROL));
+      OUT_RING(ring, 0);
+   }
 
    fd2_program_emit(ctx, ring, &ctx->blit_prog[0]);
 
