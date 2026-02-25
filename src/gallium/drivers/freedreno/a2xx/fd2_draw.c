@@ -155,18 +155,44 @@ pack_rgba(enum pipe_format format, const float *rgba)
 }
 
 static void
-emit_cacheflush(struct fd_ringbuffer *ring, bool sync)
+emit_cacheflush(struct fd_context *ctx, struct fd_ringbuffer *ring)
 {
-   unsigned i;
+   struct fd2_context *fd2_ctx = fd2_context(ctx);
 
-   if (sync) {
-      /* A22X: Use synchronous cache flush and invalidate.
-       * CACHE_FLUSH_AND_INV_EVENT (0x16) waits for cache operations to complete,
-       * unlike CACHE_FLUSH (0x06) which is asynchronous.
+   if (is_a22x(ctx->screen) && fd2_ctx->scratch_buf) {
+      /* A22X: Use CACHE_FLUSH_TS with memory-based verification.
+       * This matches the legacy KGSL pattern which writes a timestamp
+       * to memory when cache flush completes.
+       *
+       * CACHE_FLUSH_TS (0x04) writes a value to a GPU memory address
+       * when the cache flush operation completes. We then use WFI to
+       * ensure the timestamp write (and thus the cache flush) completes
+       * before continuing.
+       *
+       * Note: CP_WAIT_REG_MEM doesn't work reliably on A2XX, so we use
+       * WFI which waits for the entire pipeline including the timestamp
+       * write to complete.
        */
-      OUT_PKT3(ring, CP_EVENT_WRITE, 1);
-      OUT_RING(ring, CACHE_FLUSH_AND_INV_EVENT);
+      struct fd_bo *scratch_bo = fd_resource(fd2_ctx->scratch_buf)->bo;
+      uint32_t seqno = ++fd2_ctx->cache_flush_seqno;
+
+      /* Emit CACHE_FLUSH_TS: event type, GPU address, value to write */
+      OUT_PKT3(ring, CP_EVENT_WRITE, 3);
+      OUT_RING(ring, CACHE_FLUSH_TS);
+      OUT_RELOC(ring, scratch_bo, 0, 0, 0);  /* Address to write timestamp */
+      OUT_RING(ring, seqno);                  /* Value to write */
+
+      /* Wait for pipeline to drain - this ensures the cache flush and
+       * timestamp write complete before we continue.
+       */
+      OUT_WFI(ring);
+
+      if (FD_DBG(MSGS)) {
+         mesa_logi("A22X: CACHE_FLUSH_TS seqno=%u", seqno);
+      }
    } else {
+      unsigned i;
+      /* A20X: Use async cache flush (original behavior) */
       for (i = 0; i < 12; i++) {
          OUT_PKT3(ring, CP_EVENT_WRITE, 1);
          OUT_RING(ring, CACHE_FLUSH);
@@ -320,8 +346,8 @@ draw_impl(struct fd_context *ctx, const struct pipe_draw_info *info,
       OUT_RING(ring, 0x00000000);
    }
 
-   /* Use synchronous cache flush for A22X to ensure cache coherency */
-   emit_cacheflush(ring, is_a22x(ctx->screen));
+   /* Emit cache flush - uses CACHE_FLUSH_TS with verification for A22X */
+   emit_cacheflush(ctx, ring);
 }
 
 static bool

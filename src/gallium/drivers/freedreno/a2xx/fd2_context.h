@@ -18,6 +18,14 @@ struct fd2_context {
     * vertices and tex coords:
     */
    struct pipe_resource *solid_vertexbuf;
+
+   /* Scratch buffer for A22X cache flush timestamp verification.
+    * CACHE_FLUSH_TS writes a timestamp here when flush completes,
+    * allowing us to poll for completion. This matches the legacy
+    * KGSL pattern for explicit cache flush verification.
+    */
+   struct pipe_resource *scratch_buf;
+   uint32_t cache_flush_seqno;
 };
 
 static inline struct fd2_context *

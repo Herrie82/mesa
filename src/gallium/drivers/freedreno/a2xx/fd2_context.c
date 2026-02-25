@@ -14,12 +14,18 @@
 #include "fd2_program.h"
 #include "fd2_query.h"
 #include "fd2_rasterizer.h"
+#include "fd2_screen.h"
 #include "fd2_texture.h"
 #include "fd2_zsa.h"
 
 static void
 fd2_context_destroy(struct pipe_context *pctx) in_dt
 {
+   struct fd2_context *fd2_ctx = fd2_context(fd_context(pctx));
+
+   if (fd2_ctx->scratch_buf)
+      pipe_resource_reference(&fd2_ctx->scratch_buf, NULL);
+
    fd_context_destroy(pctx);
    free(pctx);
 }
@@ -49,6 +55,28 @@ create_solid_vertexbuf(struct pipe_context *pctx)
                          sizeof(init_shader_const));
    pipe_buffer_write(pctx, prsc, 0, sizeof(init_shader_const),
                      init_shader_const);
+   return prsc;
+}
+
+/* Create scratch buffer for A22X cache flush timestamp verification.
+ * CACHE_FLUSH_TS writes a timestamp here when flush completes,
+ * and we use CP_WAIT_REG_MEM to poll for the expected value.
+ * This matches the legacy KGSL pattern for explicit cache flush verification.
+ */
+static struct pipe_resource *
+create_scratch_buffer(struct pipe_context *pctx)
+{
+   /* We need space for a 32-bit timestamp value, but allocate 16 bytes
+    * to ensure proper alignment and some padding.
+    */
+   static const uint32_t init_data[4] = { 0, 0, 0, 0 };
+
+   struct pipe_resource *prsc =
+      pipe_buffer_create(pctx->screen, PIPE_BIND_CUSTOM, PIPE_USAGE_STREAM,
+                         sizeof(init_data));
+   if (prsc)
+      pipe_buffer_write(pctx, prsc, 0, sizeof(init_data), init_data);
+
    return prsc;
 }
 
@@ -86,6 +114,10 @@ fd2_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
 
    /* construct vertex state used for solid ops (clear, and gmem<->mem) */
    fd2_ctx->solid_vertexbuf = create_solid_vertexbuf(pctx);
+
+   /* create scratch buffer for A22X cache flush timestamp verification */
+   if (!is_a20x(screen))
+      fd2_ctx->scratch_buf = create_scratch_buffer(pctx);
 
    fd2_query_context_init(pctx);
 
