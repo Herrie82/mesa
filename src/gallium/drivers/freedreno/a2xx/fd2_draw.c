@@ -284,6 +284,28 @@ draw_impl(struct fd_context *ctx, const struct pipe_draw_info *info,
    if (binning || info->mode == MESA_PRIM_POINTS)
       vismode = IGNORE_VISIBILITY;
 
+   /* A22X "Hammer" Test: Aggressive VPC synchronization before draw.
+    * The Vertex Parameter Cache (VPC) bridges VS outputs to FS inputs.
+    * If FS starts reading before VPC commits all VS outputs for the triangle,
+    * we get flat/faceted shading instead of smooth interpolation.
+    * This aggressive sync ensures VS outputs are fully committed to VPC
+    * before the draw command starts fragment processing.
+    */
+   if (is_a22x(ctx->screen)) {
+      /* Synchronous cache flush - ensures all pending writes complete */
+      OUT_PKT3(ring, CP_EVENT_WRITE, 1);
+      OUT_RING(ring, CACHE_FLUSH_AND_INV_EVENT);
+      /* Wait for GPU to be completely idle */
+      OUT_WFI(ring);
+      /* Re-assert SQ_INTERPOLATOR_CNTL right before draw to ensure smooth
+       * interpolation is enabled. This combats potential state corruption
+       * from compositor or previous contexts touching GPU state.
+       */
+      OUT_PKT3(ring, CP_SET_CONSTANT, 2);
+      OUT_RING(ring, CP_REG(REG_A2XX_SQ_INTERPOLATOR_CNTL));
+      OUT_RING(ring, 0xffffffff);
+   }
+
    fd_draw_emit(ctx->batch, ring, ctx->screen->primtypes[info->mode],
                 vismode, info, draw, index_offset);
 
