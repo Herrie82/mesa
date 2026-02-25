@@ -434,9 +434,20 @@ fd2_emit_restore(struct fd_context *ctx, struct fd_ringbuffer *ring)
       OUT_RING(ring, CP_REG(REG_A2XX_VGT_OUT_DEALLOC_CNTL));
       OUT_RING(ring, 0x00000002);
    } else {
+      /* A22X: Use same VGT settings as KGSL driver (kgsl_drawctxt.c:941-943).
+       * KGSL sets VGT_VERTEX_REUSE_BLOCK_CNTL=0x02 and VGT_OUT_DEALLOC_CNTL=0x02
+       * for ALL A2XX chips including Leia. Using higher VTX_REUSE_DEPTH (0x3b)
+       * can cause VPC race conditions where the fragment shader reads varyings
+       * before the vertex shader has finished writing them, resulting in
+       * intermittent faceted rendering instead of smooth shading.
+       */
       OUT_PKT3(ring, CP_SET_CONSTANT, 2);
       OUT_RING(ring, CP_REG(REG_A2XX_VGT_VERTEX_REUSE_BLOCK_CNTL));
-      OUT_RING(ring, 0x0000003b);
+      OUT_RING(ring, 0x00000002);
+
+      OUT_PKT3(ring, CP_SET_CONSTANT, 2);
+      OUT_RING(ring, CP_REG(REG_A2XX_VGT_OUT_DEALLOC_CNTL));
+      OUT_RING(ring, 0x00000002);
    }
 
    /* enable perfcntrs */
