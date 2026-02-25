@@ -567,6 +567,27 @@ fd2_emit_restore(struct fd_context *ctx, struct fd_ringbuffer *ring)
       mesa_logi("A2XX: SQ_INST_STORE_MANAGMENT=0x00000180");
    }
 
+   /* A22X: Initialize Leia-specific SQ registers that are defined in KGSL
+    * but never used. These may affect pixel shader input handling.
+    *
+    * REG_LEIA_SQ_RESOURCE_MANAGMENT (0x0d03) - shader resource allocation
+    * REG_LEIA_SQ_PIX_IN_CNTL (0x0d0c) - pixel input control, may affect
+    *   varying interpolation and barycentric coordinate handling.
+    *
+    * Try enabling all bits to allow all pixel inputs.
+    */
+   if (!is_a20x(ctx->screen)) {
+      OUT_PKT0(ring, 0x0d03, 1);  /* SQ_RESOURCE_MANAGMENT */
+      OUT_RING(ring, 0x00000000);
+
+      OUT_PKT0(ring, 0x0d0c, 1);  /* SQ_PIX_IN_CNTL */
+      OUT_RING(ring, 0xffffffff); /* Enable all pixel inputs */
+
+      if (FD_DBG(MSGS)) {
+         mesa_logi("A22X: SQ_RESOURCE_MANAGMENT=0x0, SQ_PIX_IN_CNTL=0xffffffff");
+      }
+   }
+
    OUT_PKT3(ring, CP_INVALIDATE_STATE, 1);
    OUT_RING(ring, 0x00000300);
 
