@@ -569,6 +569,57 @@ output_slot(struct ir2_context *ctx, nir_intrinsic_instr *intr)
    return slot;
 }
 
+/* A22X workaround: Export varying as full vec4, padding unused components
+ * with zeros. This may fix intermittent faceted rendering caused by partial
+ * writes to the parameter cache.
+ *
+ * Theory: A220 has hardware issues when export write_mask is not 0b1111,
+ * causing race conditions in interpolation.
+ */
+static void
+store_output_vec4_padded(struct ir2_context *ctx, nir_src src, unsigned idx,
+                         unsigned ncomp)
+{
+   struct ir2_instr *instr;
+
+   if (ncomp >= 4) {
+      /* Already vec4, no padding needed */
+      instr = instr_create_alu(ctx, nir_op_mov, 4);
+      instr->src[0] = make_src(ctx, src);
+      instr->alu.export = idx;
+      return;
+   }
+
+   /* Create a temp register to hold the padded vec4 */
+   struct ir2_instr *temp = instr_create_alu_reg(ctx, nir_op_mov, 0xf, NULL);
+
+   /* Initialize all 4 components to zero */
+   temp->src[0] = ir2_zero(ctx);
+
+   /* Copy the actual varying components over the zeros */
+   unsigned src_mask = (1 << ncomp) - 1;  /* e.g., 0b0011 for vec2 */
+   struct ir2_instr *copy = instr_create_alu_reg(ctx, nir_op_mov, src_mask, temp);
+   copy->src[0] = make_src(ctx, src);
+
+   /* Export the full vec4 from temp register */
+   unsigned reg_idx = temp->reg - ctx->reg;
+   instr = instr_create_alu(ctx, nir_op_mov, 4);
+   instr->src[0] = ir2_src(reg_idx, 0, IR2_SRC_REG);
+   instr->alu.export = idx;
+
+   if (FD_DBG(MSGS)) {
+      mesa_logi("A22X: Padded vec%u export to vec4 (idx=%u)", ncomp, idx);
+   }
+}
+
+/* Helper to check if we should use vec4 padding for A22X */
+static inline bool
+needs_vec4_export_padding(struct ir2_context *ctx)
+{
+   /* A22X = not A20X */
+   return !ctx->so->is_a20x;
+}
+
 static void
 store_output(struct ir2_context *ctx, nir_src src, unsigned slot,
              unsigned ncomp)
@@ -596,6 +647,16 @@ store_output(struct ir2_context *ctx, nir_src src, unsigned slot,
       }
    } else if (slot != FRAG_RESULT_COLOR && slot != FRAG_RESULT_DATA0) {
       /* only color output is implemented */
+      return;
+   }
+
+   /* A22X workaround: For vertex shader varying exports, use padded vec4
+    * to ensure all 4 components have defined values. This may fix
+    * intermittent faceted rendering on A220.
+    */
+   if (ctx->so->type == MESA_SHADER_VERTEX && idx < 32 &&
+       needs_vec4_export_padding(ctx) && ncomp < 4) {
+      store_output_vec4_padded(ctx, src, idx, ncomp);
       return;
    }
 
