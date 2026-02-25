@@ -443,10 +443,14 @@ fd2_emit_restore(struct fd_context *ctx, struct fd_ringbuffer *ring)
    OUT_PKT0(ring, REG_A2XX_CP_PERFMON_CNTL, 1);
    OUT_RING(ring, COND(FD_DBG(PERFC), 1));
 
-   /* note: perfcntrs don't work without the PM_OVERRIDE bit */
+   /* note: perfcntrs don't work without the PM_OVERRIDE bit
+    * A22X (Leia) requires RBBM_PM_OVERRIDE2=0x1a0 per KGSL driver, not 0xfff.
+    * Using incorrect clock gating overrides causes timing issues that manifest
+    * as intermittent faceted rendering (varyings not smoothly interpolated).
+    */
    OUT_PKT0(ring, REG_A2XX_RBBM_PM_OVERRIDE1, 2);
    OUT_RING(ring, 0xffffffff);
-   OUT_RING(ring, 0x00000fff);
+   OUT_RING(ring, is_a22x(ctx->screen) ? 0x1a0 : 0x00000fff);
 
    OUT_PKT0(ring, REG_A2XX_TP0_CHICKEN, 1);
    OUT_RING(ring, 0x00000002);
