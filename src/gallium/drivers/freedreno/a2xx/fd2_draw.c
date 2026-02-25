@@ -556,12 +556,11 @@ clear_state_restore(struct fd_context *ctx, struct fd_ringbuffer *ring)
    OUT_RING(ring, CP_REG(REG_A2XX_A220_RB_LRZ_VSC_CONTROL));
    OUT_RING(ring, 0x00000000);
 
-   /* Restore VGT_VERTEX_REUSE_BLOCK_CNTL to KGSL-compatible value.
-    * Using 0x02 per KGSL kgsl_drawctxt.c:942 to prevent VPC race conditions.
+   /* Restore VGT_VERTEX_REUSE_BLOCK_CNTL - disabled (0) to debug black faces.
     */
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
    OUT_RING(ring, CP_REG(REG_A2XX_VGT_VERTEX_REUSE_BLOCK_CNTL));
-   OUT_RING(ring, 0x00000002);
+   OUT_RING(ring, 0x00000000);  /* Disable vertex reuse */
 }
 
 static void
