@@ -644,6 +644,15 @@ fd2_emit_restore(struct fd_context *ctx, struct fd_ringbuffer *ring)
       OUT_RING(ring, CP_REG(REG_A2XX_A220_RB_LRZ_VSC_CONTROL));
       OUT_RING(ring, 0x00000000);
 
+      /* Initialize A220_GRAS_CONTROL to 0.
+       * KGSL restores this register in context switch (range 0x2208-0x2210).
+       * Without explicit initialization, compositor can change this register
+       * and cause faceted rendering in other GL contexts.
+       */
+      OUT_PKT3(ring, CP_SET_CONSTANT, 2);
+      OUT_RING(ring, CP_REG(REG_A2XX_A220_GRAS_CONTROL));
+      OUT_RING(ring, 0x00000000);
+
       /* Initialize A220_VSC_BIN_SIZE to 0 */
       OUT_PKT0(ring, REG_A2XX_A220_VSC_BIN_SIZE, 1);
       OUT_RING(ring, 0x00000000);
@@ -659,7 +668,7 @@ fd2_emit_restore(struct fd_context *ctx, struct fd_ringbuffer *ring)
       }
 
       if (FD_DBG(MSGS)) {
-         mesa_logi("A22X: VSC registers initialized (VSC_BIN_SIZE=0, LRZ_VSC_CONTROL=0, all pipes=0)");
+         mesa_logi("A22X: VSC/GRAS registers initialized (VSC_BIN_SIZE=0, LRZ_VSC_CONTROL=0, GRAS_CONTROL=0, all pipes=0)");
       }
    }
 }
