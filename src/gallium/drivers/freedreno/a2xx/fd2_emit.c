@@ -457,9 +457,13 @@ fd2_emit_restore(struct fd_context *ctx, struct fd_ringbuffer *ring)
     * Using incorrect clock gating overrides causes timing issues that manifest
     * as intermittent faceted rendering (varyings not smoothly interpolated).
     */
+   /* Force all GPU clocks/power domains on to test if clock gating
+    * causes intermittent faceted rendering. KGSL uses 0xfffffffe/0xff
+    * during init, then relaxes to 0/0x1a0 after. Try forcing full power.
+    */
    OUT_PKT0(ring, REG_A2XX_RBBM_PM_OVERRIDE1, 2);
-   OUT_RING(ring, 0xffffffff);
-   OUT_RING(ring, is_a22x(ctx->screen) ? 0x1a0 : 0x00000fff);
+   OUT_RING(ring, 0xfffffffe);  /* Force all clocks on */
+   OUT_RING(ring, 0xffffffff);  /* Force all power domains on */
 
    OUT_PKT0(ring, REG_A2XX_TP0_CHICKEN, 1);
    OUT_RING(ring, 0x00000002);
