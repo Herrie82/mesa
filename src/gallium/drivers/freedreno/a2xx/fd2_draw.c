@@ -318,11 +318,26 @@ draw_impl(struct fd_context *ctx, const struct pipe_draw_info *info,
     * before the draw command starts fragment processing.
     */
    if (is_a22x(ctx->screen)) {
+      /* TILE_FLUSH (0x0f): Flush tile/binning state before draw.
+       * This ensures previous tile operations are complete.
+       */
+      OUT_PKT3(ring, CP_EVENT_WRITE, 1);
+      OUT_RING(ring, TILE_FLUSH);
+
+      /* FACENESS_FLUSH (0x1c): Flush faceted rendering state.
+       * This event specifically clears the facet/primitive state
+       * that controls smooth vs flat interpolation.
+       */
+      OUT_PKT3(ring, CP_EVENT_WRITE, 1);
+      OUT_RING(ring, FACENESS_FLUSH);
+
       /* Synchronous cache flush - ensures all pending writes complete */
       OUT_PKT3(ring, CP_EVENT_WRITE, 1);
       OUT_RING(ring, CACHE_FLUSH_AND_INV_EVENT);
+
       /* Wait for GPU to be completely idle */
       OUT_WFI(ring);
+
       /* Re-assert SQ_INTERPOLATOR_CNTL right before draw to ensure smooth
        * interpolation is enabled. This combats potential state corruption
        * from compositor or previous contexts touching GPU state.
