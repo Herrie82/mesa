@@ -185,6 +185,15 @@ fd2_program_emit(struct fd_context *ctx, struct fd_ringbuffer *ring,
          patch_fetches(ctx, fpi, NULL, &ctx->tex[MESA_SHADER_FRAGMENT]);
    }
 
+   /* A22X: Invalidate shader queue state before uploading new shaders.
+    * This ensures the SQ doesn't use stale cached shader state from
+    * previous draws. Bit 0x100 specifically invalidates VS/PS program state.
+    */
+   if (is_a22x(ctx->screen)) {
+      OUT_PKT3(ring, CP_INVALIDATE_STATE, 1);
+      OUT_RING(ring, 0x00007fff);  /* Invalidate all state */
+   }
+
    emit(ring, MESA_SHADER_VERTEX, vpi,
         binning ? &ctx->batch->shader_patches : NULL);
 
