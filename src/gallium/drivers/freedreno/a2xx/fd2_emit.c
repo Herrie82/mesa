@@ -498,13 +498,25 @@ fd2_emit_restore(struct fd_context *ctx, struct fd_ringbuffer *ring)
    OUT_RING(ring, CP_REG(REG_A2XX_SQ_INTERPOLATOR_CNTL));
    OUT_RING(ring, 0xffffffff);
 
-   /* Debug: Log interpolator control value. This register controls how
-    * varying inputs are interpolated (smooth vs flat shading). 0xffffffff
-    * means all varyings use smooth interpolation.
+   /* Initialize PA_SU_SC_MODE_CNTL to a known state with perspective
+    * correction ENABLED (PERSP_CORR_DIS bit 20 = 0). This register controls
+    * polygon setup including culling, provoking vertex, and critically,
+    * whether perspective-correct interpolation is used for varyings.
+    *
+    * If PERSP_CORR_DIS is set (by a previous context or GPU operation),
+    * varyings will be interpolated linearly instead of perspective-correctly,
+    * causing faceted/flat shading appearance even when SQ_INTERPOLATOR_CNTL
+    * requests smooth interpolation.
+    *
+    * Set a safe default: no culling, last vertex provoking, perspective
+    * correction enabled (bit 20 NOT set).
     */
-   if (FD_DBG(MSGS)) {
-      mesa_logi("A2XX: SQ_INTERPOLATOR_CNTL=0xffffffff (all smooth)");
-   }
+   OUT_PKT3(ring, CP_SET_CONSTANT, 2);
+   OUT_RING(ring, CP_REG(REG_A2XX_PA_SU_SC_MODE_CNTL));
+   OUT_RING(ring, A2XX_PA_SU_SC_MODE_CNTL_VTX_WINDOW_OFFSET_ENABLE |
+                  A2XX_PA_SU_SC_MODE_CNTL_PROVOKING_VTX_LAST |
+                  A2XX_PA_SU_SC_MODE_CNTL_FRONT_PTYPE(PC_DRAW_TRIANGLES) |
+                  A2XX_PA_SU_SC_MODE_CNTL_BACK_PTYPE(PC_DRAW_TRIANGLES));
 
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
    OUT_RING(ring, CP_REG(REG_A2XX_PA_SC_AA_CONFIG));
