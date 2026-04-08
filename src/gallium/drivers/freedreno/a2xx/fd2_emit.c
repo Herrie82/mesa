@@ -354,21 +354,6 @@ fd2_emit_state(struct fd_context *ctx, const enum fd_dirty_3d_state dirty)
    if (dirty & (FD_DIRTY_PROG | FD_DIRTY_VTXSTATE | FD_DIRTY_TEXSTATE))
       fd2_program_emit(ctx, ring, &ctx->prog);
 
-   /* A22X: Always write SQ_INTERPOLATOR_CNTL to ensure smooth interpolation.
-    * This is a workaround for random faceted rendering issues where the
-    * register appears to get corrupted between draws. Even though
-    * fd2_program_emit writes this register, it's only called when dirty
-    * flags are set. This unconditional write ensures correct state on
-    * every draw.
-    *
-    * TODO: Find the root cause of the corruption and remove this workaround.
-    */
-   if (is_a22x(ctx->screen)) {
-      OUT_PKT3(ring, CP_SET_CONSTANT, 2);
-      OUT_RING(ring, CP_REG(REG_A2XX_SQ_INTERPOLATOR_CNTL));
-      OUT_RING(ring, 0xffffffff);
-   }
-
    if (dirty & (FD_DIRTY_PROG | FD_DIRTY_CONST)) {
       emit_constants(ring, VS_CONST_BASE * 4,
                      &ctx->constbuf[MESA_SHADER_VERTEX],
