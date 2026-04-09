@@ -1,0 +1,166 @@
+From 74c915df3c0495d0dad84f2fe13ff5d4645f6031 Mon Sep 17 00:00:00 2001
+From: Herman van Hazendonk <github.com@herrie.org>
+Date: Wed, 8 Apr 2026 20:01:21 +0200
+Subject: [PATCH] freedreno/a2xx: invalidate SQ state before shader upload
+
+Add CP_INVALIDATE_STATE before uploading shader instructions to ensure
+the shader queue doesn't use stale cached state from previous draws.
+
+This is another attempt to fix the random faceted rendering issue where
+smooth shading randomly switches to flat shading mid-run.
+
+Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
+---
+ ...orce-SQ_INTERPOLATOR_CNTL-on-every-d.patch | 50 +++++++++++++++
+ ...nitialize-PA_SU_SC_MODE_CNTL-in-fd2_.patch | 64 +++++++++++++++++++
+ .../drivers/freedreno/a2xx/fd2_program.c      |  9 +++
+ 3 files changed, 123 insertions(+)
+ create mode 100644 0001-freedreno-a2xx-force-SQ_INTERPOLATOR_CNTL-on-every-d.patch
+ create mode 100644 0001-freedreno-a2xx-initialize-PA_SU_SC_MODE_CNTL-in-fd2_.patch
+
+diff --git a/0001-freedreno-a2xx-force-SQ_INTERPOLATOR_CNTL-on-every-d.patch b/0001-freedreno-a2xx-force-SQ_INTERPOLATOR_CNTL-on-every-d.patch
+new file mode 100644
+index 00000000000..ad63b7f2d0b
+--- /dev/null
++++ b/0001-freedreno-a2xx-force-SQ_INTERPOLATOR_CNTL-on-every-d.patch
+@@ -0,0 +1,50 @@
++From 246a15164c2cb572a3aa8a66cb52d66fbe0b35c0 Mon Sep 17 00:00:00 2001
++From: Herman van Hazendonk <github.com@herrie.org>
++Date: Wed, 8 Apr 2026 18:55:11 +0200
++Subject: [PATCH] freedreno/a2xx: force SQ_INTERPOLATOR_CNTL on every draw
++
++Write SQ_INTERPOLATOR_CNTL=0xffffffff unconditionally on every draw
++call for A22X. This is a diagnostic workaround for random faceted
++rendering issues where smooth shading randomly switches to flat
++shading mid-run.
++
++The fd2_program_emit() function already writes this register, but
++only when dirty flags (FD_DIRTY_PROG | FD_DIRTY_VTXSTATE |
++FD_DIRTY_TEXSTATE) are set. For subsequent draws with the same
++shader, the register isn't re-written. If something corrupts the
++register between draws, the corruption persists.
++
++This unconditional write ensures correct interpolation state on
++every draw until the root cause of the corruption is identified.
++
++Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
++---
++ src/gallium/drivers/freedreno/a2xx/fd2_emit.c | 15 +++++++++++++++
++ 1 file changed, 15 insertions(+)
++
++diff --git a/src/gallium/drivers/freedreno/a2xx/fd2_emit.c b/src/gallium/drivers/freedreno/a2xx/fd2_emit.c
++index 40257b1011d..db3bb2e3a18 100644
++--- a/src/gallium/drivers/freedreno/a2xx/fd2_emit.c
+++++ b/src/gallium/drivers/freedreno/a2xx/fd2_emit.c
++@@ -354,6 +354,21 @@ fd2_emit_state(struct fd_context *ctx, const enum fd_dirty_3d_state dirty)
++    if (dirty & (FD_DIRTY_PROG | FD_DIRTY_VTXSTATE | FD_DIRTY_TEXSTATE))
++       fd2_program_emit(ctx, ring, &ctx->prog);
++ 
+++   /* A22X: Always write SQ_INTERPOLATOR_CNTL to ensure smooth interpolation.
+++    * This is a workaround for random faceted rendering issues where the
+++    * register appears to get corrupted between draws. Even though
+++    * fd2_program_emit writes this register, it's only called when dirty
+++    * flags are set. This unconditional write ensures correct state on
+++    * every draw.
+++    *
+++    * TODO: Find the root cause of the corruption and remove this workaround.
+++    */
+++   if (is_a22x(ctx->screen)) {
+++      OUT_PKT3(ring, CP_SET_CONSTANT, 2);
+++      OUT_RING(ring, CP_REG(REG_A2XX_SQ_INTERPOLATOR_CNTL));
+++      OUT_RING(ring, 0xffffffff);
+++   }
+++
++    if (dirty & (FD_DIRTY_PROG | FD_DIRTY_CONST)) {
++       emit_constants(ring, VS_CONST_BASE * 4,
++                      &ctx->constbuf[MESA_SHADER_VERTEX],
+diff --git a/0001-freedreno-a2xx-initialize-PA_SU_SC_MODE_CNTL-in-fd2_.patch b/0001-freedreno-a2xx-initialize-PA_SU_SC_MODE_CNTL-in-fd2_.patch
+new file mode 100644
+index 00000000000..29419c3bcb1
+--- /dev/null
++++ b/0001-freedreno-a2xx-initialize-PA_SU_SC_MODE_CNTL-in-fd2_.patch
+@@ -0,0 +1,64 @@
++From a248385e831ba2a49139d7c76dbbfabb0a69d6c9 Mon Sep 17 00:00:00 2001
++From: Herman van Hazendonk <github.com@herrie.org>
++Date: Wed, 8 Apr 2026 19:20:14 +0200
++Subject: [PATCH] freedreno/a2xx: initialize PA_SU_SC_MODE_CNTL in
++ fd2_emit_restore
++
++Initialize PA_SU_SC_MODE_CNTL to a known state in fd2_emit_restore()
++with perspective correction ENABLED (PERSP_CORR_DIS bit 20 = 0).
++
++This register was never initialized at batch start, only written when
++FD_DIRTY_RASTERIZER was set. If a previous GPU context or operation
++set PERSP_CORR_DIS (perspective correction disable), it would remain
++set, causing varyings to be interpolated linearly instead of with
++perspective correction. This results in faceted/flat shading even
++when SQ_INTERPOLATOR_CNTL requests smooth interpolation.
++
++The random nature of the bug (sometimes smooth, sometimes faceted,
++can change mid-run) is explained by register state leaking from
++other GPU operations that may or may not set this bit.
++
++Credit: Gemini identified PA_SU_SC_MODE_CNTL and PERSP_CORR_DIS as
++the likely culprit after SQ_INTERPOLATOR_CNTL was ruled out.
++
++Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
++---
++ src/gallium/drivers/freedreno/a2xx/fd2_emit.c | 24 ++++++++++++++-----
++ 1 file changed, 18 insertions(+), 6 deletions(-)
++
++diff --git a/src/gallium/drivers/freedreno/a2xx/fd2_emit.c b/src/gallium/drivers/freedreno/a2xx/fd2_emit.c
++index 40257b1011d..1f44a7ded3d 100644
++--- a/src/gallium/drivers/freedreno/a2xx/fd2_emit.c
+++++ b/src/gallium/drivers/freedreno/a2xx/fd2_emit.c
++@@ -498,13 +498,25 @@ fd2_emit_restore(struct fd_context *ctx, struct fd_ringbuffer *ring)
++    OUT_RING(ring, CP_REG(REG_A2XX_SQ_INTERPOLATOR_CNTL));
++    OUT_RING(ring, 0xffffffff);
++ 
++-   /* Debug: Log interpolator control value. This register controls how
++-    * varying inputs are interpolated (smooth vs flat shading). 0xffffffff
++-    * means all varyings use smooth interpolation.
+++   /* Initialize PA_SU_SC_MODE_CNTL to a known state with perspective
+++    * correction ENABLED (PERSP_CORR_DIS bit 20 = 0). This register controls
+++    * polygon setup including culling, provoking vertex, and critically,
+++    * whether perspective-correct interpolation is used for varyings.
+++    *
+++    * If PERSP_CORR_DIS is set (by a previous context or GPU operation),
+++    * varyings will be interpolated linearly instead of perspective-correctly,
+++    * causing faceted/flat shading appearance even when SQ_INTERPOLATOR_CNTL
+++    * requests smooth interpolation.
+++    *
+++    * Set a safe default: no culling, last vertex provoking, perspective
+++    * correction enabled (bit 20 NOT set).
++     */
++-   if (FD_DBG(MSGS)) {
++-      mesa_logi("A2XX: SQ_INTERPOLATOR_CNTL=0xffffffff (all smooth)");
++-   }
+++   OUT_PKT3(ring, CP_SET_CONSTANT, 2);
+++   OUT_RING(ring, CP_REG(REG_A2XX_PA_SU_SC_MODE_CNTL));
+++   OUT_RING(ring, A2XX_PA_SU_SC_MODE_CNTL_VTX_WINDOW_OFFSET_ENABLE |
+++                  A2XX_PA_SU_SC_MODE_CNTL_PROVOKING_VTX_LAST |
+++                  A2XX_PA_SU_SC_MODE_CNTL_FRONT_PTYPE(PC_DRAW_TRIANGLES) |
+++                  A2XX_PA_SU_SC_MODE_CNTL_BACK_PTYPE(PC_DRAW_TRIANGLES));
++ 
++    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
++    OUT_RING(ring, CP_REG(REG_A2XX_PA_SC_AA_CONFIG));
+diff --git a/src/gallium/drivers/freedreno/a2xx/fd2_program.c b/src/gallium/drivers/freedreno/a2xx/fd2_program.c
+index f7df2289a34..47787337405 100644
+--- a/src/gallium/drivers/freedreno/a2xx/fd2_program.c
++++ b/src/gallium/drivers/freedreno/a2xx/fd2_program.c
+@@ -185,6 +185,15 @@ fd2_program_emit(struct fd_context *ctx, struct fd_ringbuffer *ring,
+          patch_fetches(ctx, fpi, NULL, &ctx->tex[MESA_SHADER_FRAGMENT]);
+    }
+ 
++   /* A22X: Invalidate shader queue state before uploading new shaders.
++    * This ensures the SQ doesn't use stale cached shader state from
++    * previous draws. Bit 0x100 specifically invalidates VS/PS program state.
++    */
++   if (is_a22x(ctx->screen)) {
++      OUT_PKT3(ring, CP_INVALIDATE_STATE, 1);
++      OUT_RING(ring, 0x00007fff);  /* Invalidate all state */
++   }
++
+    emit(ring, MESA_SHADER_VERTEX, vpi,
+         binning ? &ctx->batch->shader_patches : NULL);
+ 
