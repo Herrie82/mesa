@@ -144,7 +144,7 @@ prepare_tile_fini_ib(struct fd_batch *batch) assert_dt
    if (!is_a20x(ctx->screen)) {
       OUT_PKT3(ring, CP_SET_CONSTANT, 2);
       OUT_RING(ring, CP_REG(REG_A2XX_VGT_VERTEX_REUSE_BLOCK_CNTL));
-      OUT_RING(ring, 0x00000000);  /* Disable vertex reuse for A22X faceted debug */
+      OUT_RING(ring, 0x0000028f);
    }
 
    fd2_program_emit(ctx, ring, &ctx->solid_prog);
