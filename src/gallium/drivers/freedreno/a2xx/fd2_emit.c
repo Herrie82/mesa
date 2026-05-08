@@ -471,6 +471,39 @@ fd2_emit_restore(struct fd_context *ctx, struct fd_ringbuffer *ring)
    OUT_PKT3(ring, CP_INVALIDATE_STATE, 1);
    OUT_RING(ring, 0x00007fff);
 
+   /*
+    * Invalidate the L2 texture cache (TC) at every batch start.
+    *
+    * Mesa's dirty-flag tracking + patch 0038 (mark all state dirty after
+    * GMEM tile setup/resolve/sysmem_prep) ensures the cmdstream emits
+    * the correct register values across batch boundaries, but the GPU
+    * L2 texture cache is keyed by physical address and persists across
+    * processes. Kernel-side gpummu_unmap invalidates the MMU TLB
+    * (MH_MMU_INVALIDATE_TC = MMU translation cache) but NOT the L2
+    * texture cache.
+    *
+    * When a GLES client (e.g. kmscube) inherits CMA-allocated BOs at
+    * physical pages a previous client (e.g. luna-surfacemanager) just
+    * vacated, the GPU TC may still hold the previous client's texture
+    * data at those physical addresses. CPU writes via glTexImage2D do
+    * not invalidate GPU TC, so the GPU samples stale data.
+    *
+    * Symptoms on Adreno 220 / HP TouchPad: kmscube cube faces fade in
+    * and out across runs after LSM exits; LSM glyph text shows wrong
+    * pixels; glmark2 texture test renders incorrectly on first
+    * post-LSM cycle.
+    *
+    * Invalidating L2 at batch start (where fd2_emit_restore runs) is
+    * the cheapest correct fix - one packet, no perf cost when there's
+    * nothing to invalidate, and once-per-batch frequency aligns with
+    * the natural state-restore rhythm.
+    */
+   OUT_PKT0(ring, REG_A2XX_TC_CNTL_STATUS, 1);
+   OUT_RING(ring, A2XX_TC_CNTL_STATUS_L2_INVALIDATE);
+
+   /* Wait for L2 invalidate to complete before any subsequent fetch. */
+   OUT_WFI(ring);
+
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
    OUT_RING(ring, CP_REG(REG_A2XX_SQ_VS_CONST));
    OUT_RING(ring, A2XX_SQ_VS_CONST_BASE(VS_CONST_BASE) |
