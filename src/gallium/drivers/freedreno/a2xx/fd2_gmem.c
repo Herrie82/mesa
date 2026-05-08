@@ -217,10 +217,11 @@ prepare_tile_fini_ib(struct fd_batch *batch) assert_dt
    OUT_RING(ring, A2XX_RB_MODECONTROL_EDRAM_MODE(COLOR_DEPTH));
 
    if (!is_a20x(ctx->screen)) {
-      /* Disable vertex reuse to debug black faces issue */
+      /* Restore VGT_VERTEX_REUSE_BLOCK_CNTL: was 0 (disabled debug
+       * leftover); restore to KGSL kernel default 0x02. */
       OUT_PKT3(ring, CP_SET_CONSTANT, 2);
       OUT_RING(ring, CP_REG(REG_A2XX_VGT_VERTEX_REUSE_BLOCK_CNTL));
-      OUT_RING(ring, 0x00000000);  /* Disable vertex reuse */
+      OUT_RING(ring, 0x00000002);
    }
 }
 
@@ -745,15 +746,20 @@ fd2_emit_tile_init(struct fd_batch *batch) assert_dt
          OUT_RING(ring, fui(0.0f));
       }
 
+      /* Disable vertex reuse during binning (legitimate - binning has
+       * its own vertex processing constraints). */
       OUT_PKT3(ring, CP_SET_CONSTANT, 2);
       OUT_RING(ring, CP_REG(REG_A2XX_VGT_VERTEX_REUSE_BLOCK_CNTL));
       OUT_RING(ring, 0);
 
       fd2_emit_ib(ring, batch->binning);
 
+      /* Restore VGT_VERTEX_REUSE_BLOCK_CNTL after binning - was 0
+       * (debug leftover that was never reverted); restore to KGSL
+       * kernel default 0x02. */
       OUT_PKT3(ring, CP_SET_CONSTANT, 2);
       OUT_RING(ring, CP_REG(REG_A2XX_VGT_VERTEX_REUSE_BLOCK_CNTL));
-      OUT_RING(ring, 0x00000000);  /* Disable vertex reuse */
+      OUT_RING(ring, 0x00000002);
    } else {
       patch_draws(batch, IGNORE_VISIBILITY);
    }

@@ -597,11 +597,16 @@ clear_state_restore(struct fd_context *ctx, struct fd_ringbuffer *ring)
    OUT_RING(ring, CP_REG(REG_A2XX_A220_RB_LRZ_VSC_CONTROL));
    OUT_RING(ring, 0x00000000);
 
-   /* Restore VGT_VERTEX_REUSE_BLOCK_CNTL - disabled (0) to debug black faces.
+   /*
+    * Restore VGT_VERTEX_REUSE_BLOCK_CNTL after the clear_fast path.
+    * Previously this was set to 0 ("disabled to debug black faces") -
+    * a debug leftover that was never reverted. Restore to KGSL kernel
+    * default (and Mesa a20x parity) so vertex shading isn't pessimized
+    * after every fast clear. See sibling change in fd2_emit_restore.
     */
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
    OUT_RING(ring, CP_REG(REG_A2XX_VGT_VERTEX_REUSE_BLOCK_CNTL));
-   OUT_RING(ring, 0x00000000);  /* Disable vertex reuse */
+   OUT_RING(ring, 0x00000002);
 }
 
 static void

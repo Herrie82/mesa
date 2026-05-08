@@ -458,14 +458,34 @@ fd2_emit_restore(struct fd_context *ctx, struct fd_ringbuffer *ring)
       OUT_RING(ring, CP_REG(REG_A2XX_VGT_OUT_DEALLOC_CNTL));
       OUT_RING(ring, 0x00000002);
    } else {
-      /* A22X: Try disabling vertex reuse entirely to debug black faces issue.
-       * Setting VGT_VERTEX_REUSE_BLOCK_CNTL=0 forces each vertex to be processed
-       * fresh without reusing cached results. This is slower but may fix issues
-       * where reused vertex data is stale/corrupted.
+      /*
+       * A22X (Adreno 220 / Leia): VGT_VERTEX_REUSE_BLOCK_CNTL.
+       *
+       * This was previously set to 0x00000000 ("disable vertex reuse")
+       * with a comment "Try disabling vertex reuse entirely to debug
+       * black faces issue". That was a temporary debug change that was
+       * never reverted - and disabling vertex reuse on a22x is *exactly*
+       * the kind of pessimization that hurts performance on heavy
+       * geometry (every vertex re-shaded with no cache).
+       *
+       * Cross-reference of vendor proprietary drivers (Ghidra of
+       * webOS libGLESv2.so + Samsung libGLESv2_adreno200.so) shows:
+       *   - Samsung Q1 (Adreno 220) leia_perform_resolve writes 0x3b
+       *     per draw - this is the value the proprietary userspace
+       *     driver actually uses
+       *   - KGSL kernel default (a2xx_drawctxt + adreno_drawctxt) is
+       *     0x02 (low reuse depth)
+       *   - Mesa a20x (the other branch above) writes 0x02 already
+       *
+       * Pick 0x02 (KGSL kernel default + Mesa a20x parity) rather than
+       * 0x3b (Samsung userspace value) for now - smaller change from
+       * the kernel-level baseline, less likely to introduce a
+       * regression in some untested edge case. If 0x02 doesn't fix
+       * the per-vertex color residuals, try 0x3b.
        */
       OUT_PKT3(ring, CP_SET_CONSTANT, 2);
       OUT_RING(ring, CP_REG(REG_A2XX_VGT_VERTEX_REUSE_BLOCK_CNTL));
-      OUT_RING(ring, 0x00000000);  /* Disable vertex reuse */
+      OUT_RING(ring, 0x00000002);
 
       OUT_PKT3(ring, CP_SET_CONSTANT, 2);
       OUT_RING(ring, CP_REG(REG_A2XX_VGT_OUT_DEALLOC_CNTL));
