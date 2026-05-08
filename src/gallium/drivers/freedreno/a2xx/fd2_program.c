@@ -228,54 +228,6 @@ fd2_program_emit(struct fd_context *ctx, struct fd_ringbuffer *ring,
    if (is_a22x(ctx->screen))
       OUT_WFI(ring);
 
-   /*
-    * Update SQ_GPR_MANAGEMENT per-shader to match the GPR allocation
-    * pattern the proprietary driver (libGLESv2.so) uses on Adreno 220.
-    *
-    * Layout:
-    *   bit 0      : REG_DYNAMIC  (1 = HW auto-allocates GPRs per shader)
-    *   bits 4-11  : REG_SIZE_PIX (PS GPR count)
-    *   bits 12-19 : REG_SIZE_VTX (VS GPR count)
-    *
-    * Proprietary driver in leia_perform_resolve:
-    *   value = (vs_gprs << 12) | ((128 - vs_gprs) << 4)
-    *
-    * Mesa previously hardcoded SQ_GPR_MANAGEMENT=0x00040400 in
-    * fd2_emit_restore (VS=64, PS=64, REG_DYNAMIC=0) at every batch start
-    * and never updated it per shader. If a shader needs more VS GPRs
-    * than 64, the static allocation is too small and ALU computations
-    * spill or read wrong GPR slots — matching the symptom of
-    * "wrong per-vertex colors" on shaders with many uniforms or varyings
-    * (e.g. kmscube gears with Phong lighting, or LSM glyph shaders with
-    * texture+blend uniforms).
-    *
-    * Compute the dynamic split here so it's right for every program
-    * emit, not just the static initial value. Keep REG_DYNAMIC bit set
-    * so HW can also adjust if our compiler under-estimates.
-    *
-    * vs_gprs / fs_gprs are derived from the shader's register-allocator
-    * info (max_reg + 1 effectively). Clamp PS to >= 1, total to 128.
-    */
-   {
-      uint32_t pix = MAX2(1u, 128u - (uint32_t)vs_gprs);
-      uint32_t vtx = MIN2(127u, (uint32_t)vs_gprs);
-      uint32_t sq_gpr_management =
-         0x1 |                /* REG_DYNAMIC */
-         ((pix & 0xff) << 4) | /* REG_SIZE_PIX */
-         ((vtx & 0xff) << 12); /* REG_SIZE_VTX */
-
-      OUT_PKT0(ring, REG_A2XX_SQ_GPR_MANAGEMENT, 1);
-      OUT_RING(ring, sq_gpr_management);
-
-      if (is_a22x(ctx->screen))
-         OUT_WFI(ring);
-
-      if (FD_DBG(MSGS)) {
-         mesa_logi("A2XX: SQ_GPR_MANAGEMENT=0x%08x (VS=%u PS=%u DYNAMIC)",
-                   sq_gpr_management, vtx, pix);
-      }
-   }
-
    /* set register to use for param (fragcoord/pointcoord/frontfacing) */
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
    OUT_RING(ring, CP_REG(REG_A2XX_SQ_CONTEXT_MISC));
