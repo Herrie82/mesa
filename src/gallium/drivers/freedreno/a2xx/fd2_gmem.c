@@ -228,6 +228,18 @@ static void
 fd2_emit_tile_gmem2mem(struct fd_batch *batch, const struct fd_tile *tile)
 {
    fd2_emit_ib(batch->gmem, batch->tile_store);
+
+   /*
+    * The tile_store IB (built by prepare_tile_fini_ib) clobbers the same
+    * categories of state as fd2_emit_tile_mem2gmem - shader program (uses
+    * solid_prog), vertex buffer (solid_vertexbuf), RB_DEPTHCONTROL,
+    * PA_SU_SC_MODE_CNTL, PA_SC_AA_MASK, PA_CL_VPORT, PA_CL_CLIP_CNTL,
+    * RB_MODECONTROL, VGT_VERTEX_REUSE_BLOCK_CNTL.
+    *
+    * Mark all 3D state dirty so the next user draw re-emits everything.
+    * Same rationale as the dirty mark in fd2_emit_tile_mem2gmem.
+    */
+   fd_context_all_dirty(batch->ctx);
 }
 
 /* transfer from system memory to gmem */
@@ -420,6 +432,52 @@ fd2_emit_tile_mem2gmem(struct fd_batch *batch,
                      A2XX_PA_CL_VTE_CNTL_VPORT_Y_OFFSET_ENA |
                      A2XX_PA_CL_VTE_CNTL_VPORT_Z_SCALE_ENA |
                      A2XX_PA_CL_VTE_CNTL_VPORT_Z_OFFSET_ENA);
+
+   /*
+    * The mem2gmem tile setup above forcibly overwrote a stack of RB / PA
+    * registers AND the texture-sampler / shader-program / vertex-buffer
+    * state behind the back of fd2_emit_state's dirty-flag tracking:
+    *
+    *   blend / zsa:    RB_BLEND_CONTROL, RB_COLORCONTROL, RB_DEPTHCONTROL
+    *   rasterizer:     PA_SU_SC_MODE_CNTL, PA_CL_VTE_CNTL, PA_CL_CLIP_CNTL
+    *   sample_mask:    PA_SC_AA_MASK
+    *   scissor:        PA_SC_WINDOW_SCISSOR_*
+    *   viewport:       PA_CL_VPORT_*
+    *   framebuffer:    RB_COLOR_INFO, RB_SURFACE_INFO, RB_COLOR_MASK
+    *   tex/sampler:    SQ_TEX_0..5 (left at SQ_TEX_FILTER_POINT for blit!)
+    *   program:        fd2_program_emit installs the blit shader pair
+    *   vtxbuf:         fd2_emit_vertex_bufs binds solid_vertexbuf
+    *
+    * fd2_emit_state only re-emits these on the matching dirty bit. Since
+    * the pipe-level state objects haven't changed, those bits stay clean
+    * and subsequent user draws in the next batch inherit the GMEM tile
+    * setup's values - notably blend disabled with src=ONE/dst=ZERO, and
+    * the blit's POINT-filter texture sampler with the FB-as-texture
+    * binding.
+    *
+    * Symptoms on Adreno 220 / luna-surfacemanager + kmscube:
+    *   - LSM translucent UI bars render with broken alpha (yellow/orange/red
+    *     gradients in place of expected source-over compositing)
+    *   - LSM glyph rendering: text appears in the right position but
+    *     pixels are garbled - bilinear/linear sampler in user shader
+    *     left at POINT filter from the GMEM blit
+    *   - kmscube cube faces selectively go black, gradually filling in
+    *     across frames as different draws happen to dirty other state
+    *   - Touch animation transitions show transient corruption that
+    *     "snaps back" once unrelated state changes
+    *
+    * Fix: mark all overwritten state classes dirty so the next emit_state
+    * restores them.
+    */
+   /*
+    * Maximally aggressive: mark all 3D state dirty so the next user draw
+    * re-emits every register class. This is a diagnostic build to confirm
+    * whether the dirty-flag mechanism is the right lever at all - if this
+    * doesn't fix the post-LSM kmscube "white triangle in cube model
+    * space" symptom, the bug is somewhere else (state-emit not honoring
+    * dirty bits, threaded-context queue ordering, etc).
+    */
+   fd_context_all_dirty(ctx);
 }
 
 static void
@@ -505,6 +563,18 @@ fd2_emit_sysmem_prep(struct fd_batch *batch)
    patch_draws(batch, IGNORE_VISIBILITY);
    util_dynarray_clear(&batch->draw_patches);
    util_dynarray_clear(&batch->shader_patches);
+
+   /*
+    * fd2_emit_restore (above) writes a stack of GPU state for the bypass
+    * renderer setup that fd2_emit_state's dirty-flag tracking doesn't
+    * monitor (RB_BC_CONTROL on a20x, VGT_VERTEX_REUSE_BLOCK_CNTL,
+    * RBBM_PM_OVERRIDE1/2, TP0_CHICKEN, SQ_VS_CONST/PS_CONST,
+    * VGT_*_VTX_INDX, SQ_CONTEXT_MISC, plus a CP_INVALIDATE_STATE that
+    * resets a lot more). User draws after this need to re-emit their own
+    * state to recover from the bypass-path setup. Same rationale as
+    * fd2_emit_tile_mem2gmem / fd2_emit_tile_gmem2mem.
+    */
+   fd_context_all_dirty(ctx);
 }
 
 /* before first tile */
