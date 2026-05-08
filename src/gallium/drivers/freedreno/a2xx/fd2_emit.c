@@ -622,23 +622,39 @@ fd2_emit_restore(struct fd_context *ctx, struct fd_ringbuffer *ring)
    OUT_RING(ring, 0x5f601000);
    OUT_RING(ring, 0x00000001);
 
-   /* A22X: Initialize SQ_GPR_MANAGEMENT to allocate 64 GPRs each for vertex
-    * and pixel shaders. KGSL initializes this to 0x00040400. Without proper
-    * initialization, a random value from GPU power-on could starve one
-    * shader type of GPRs, causing intermittent varying interpolation issues
-    * (e.g., faceted shading when smooth shading is expected).
+   /* A22X: Initialize SQ_GPR_MANAGEMENT for shader execution.
     *
     * Register layout (0x0d00):
-    *   REG_DYNAMIC (bit 0): 0 = static allocation
-    *   REG_SIZE_PIX (bits 4-11): 0x40 = 64 GPRs for pixel shader
-    *   REG_SIZE_VTX (bits 12-19): 0x40 = 64 GPRs for vertex shader
+    *   REG_DYNAMIC (bit 0):     1 = HW dynamically allocates per shader
+    *   REG_SIZE_PIX (bits 4-11): 0x40 = 64 GPRs PS hint
+    *   REG_SIZE_VTX (bits 12-19): 0x40 = 64 GPRs VS hint
+    *
+    * Setting REG_DYNAMIC=1 lets the hardware adjust the VS/PS GPR
+    * split based on the shader's actual needs (the proprietary KGSL-
+    * userspace driver also relies on dynamic allocation, computing
+    * the split per shader in libGLESv2.so leia_perform_resolve).
+    * Without REG_DYNAMIC, the static 64/64 split under-allocates
+    * vertex GPRs on shaders with heavy vertex computation (Phong
+    * lighting, multi-light scenes, complex glyph shaders) and
+    * computations spill or read wrong slots — symptom is
+    * per-vertex color confusion (e.g. kmscube gears partially
+    * red/blue per vertex).
+    *
+    * An earlier attempt (commit 3fcf3b9b0b0, reverted) tried to
+    * dynamically calculate the split per-shader and update this
+    * register from fd2_program_emit. That hung the GPU - likely
+    * the recalculated value path was hardware-incompatible. This
+    * patch is the conservative version: keep the same VS=64/PS=64
+    * hint but flip REG_DYNAMIC=1 so the hardware can adjust on
+    * its own. One-bit change, no new register writes, no extra
+    * WFI - lowest possible risk surface.
     */
    OUT_PKT0(ring, REG_A2XX_SQ_GPR_MANAGEMENT, 1);
-   OUT_RING(ring, 0x00040400);
+   OUT_RING(ring, 0x00040401);
 
    /* Debug: Log GPR management setup. This is critical for shader execution. */
    if (FD_DBG(MSGS)) {
-      mesa_logi("A2XX: SQ_GPR_MANAGEMENT=0x00040400 (VS=64, PS=64 GPRs)");
+      mesa_logi("A2XX: SQ_GPR_MANAGEMENT=0x00040401 (VS=64 PS=64 + REG_DYNAMIC)");
    }
 
    OUT_PKT0(ring, REG_A2XX_SQ_INST_STORE_MANAGMENT, 1);
