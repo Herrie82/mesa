@@ -413,6 +413,30 @@ fd2_emit_restore(struct fd_context *ctx, struct fd_ringbuffer *ring)
                 ++restore_count, is_a20x(ctx->screen));
    }
 
+   /*
+    * Drain the pipeline before issuing the state-restore register writes.
+    * Without an explicit WFI here, the writes can race the previous
+    * client's in-flight retirement. This is what KGSL effectively does
+    * via PM4_CONTEXT_UPDATE / PM4_LOAD_CONSTANT_CONTEXT (both of which
+    * include implicit pipeline drains and which mainline freedreno
+    * cannot use safely on a2xx because the hardware shadow-memory
+    * mechanism causes hangs).
+    *
+    * Mainline mainstream a2xx already has a CP_WAIT_REG_EQ on
+    * RBBM_STATUS later in this function, but that fires AFTER the
+    * VGT_VERTEX_REUSE_BLOCK_CNTL / RBBM_PM_OVERRIDE / TP0_CHICKEN /
+    * SQ_VS_CONST / SQ_PS_CONST / etc. writes have already gone through.
+    * The previous client's work could be touching some of those very
+    * same blocks while we write them.
+    *
+    * Adding an explicit drain here is cheap (one CP packet, no perf
+    * cost when the pipeline is already empty) and aligned with the
+    * "context-switch firewall" pattern Gemini's analysis recommends
+    * for state-pollution issues that survive cmdstream-byte-identity.
+    */
+   OUT_PKT3(ring, CP_WAIT_FOR_IDLE, 1);
+   OUT_RING(ring, 0x00000000);
+
    if (is_a20x(ctx->screen)) {
       OUT_PKT0(ring, REG_A2XX_RB_BC_CONTROL, 1);
       OUT_RING(ring, A2XX_RB_BC_CONTROL_ACCUM_TIMEOUT_SELECT(3) |
