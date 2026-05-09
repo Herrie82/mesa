@@ -548,53 +548,6 @@ fd2_emit_restore(struct fd_context *ctx, struct fd_ringbuffer *ring)
    /* Wait for L2 invalidate to complete before any subsequent fetch. */
    OUT_WFI(ring);
 
-   /*
-    * Initialize boolean and loop shader-constant memory.
-    *
-    * Adreno 2xx exposes four classes of shader-constant memory accessed
-    * via CP_SET_CONSTANT with different "type" prefixes in the address
-    * word: type=0 ALU vec4 (float) constants, type=1 texture-fetch
-    * constants, type=2 boolean constants, type=3 loop constants.
-    *
-    * Mesa freedreno's a2xx driver only ever emits type-0 (per-draw, via
-    * fd2_program emit_consts) and type-1 (per-binding, via texture
-    * state).  It NEVER emits type-2 or type-3.  KGSL (the legacy
-    * proprietary kernel driver this hardware was originally designed
-    * for) explicitly restores ALL FOUR classes on every per-context
-    * shadow restore - see kgsl_drawctxt.c build_regrestore_cmds, which
-    * emits BOOL_CONSTANTS=8 dwords (256 bool flags) and
-    * LOOP_CONSTANTS=56 dwords on every context switch.
-    *
-    * Across DRM-client transitions on mainline (e.g.
-    * luna-surfacemanager exits, kmscube starts), the GPU's bool/loop
-    * constant memory holds whatever the last shader run left there.
-    * Bool constants gate shader if-branches; loop constants set shader
-    * loop iteration counts.  Stale values cause the new shader to take
-    * the wrong control-flow path - producing exactly the symptom
-    * pattern we observe: byte-identical PM4 cmdstreams (cffdump
-    * confirmed) but different rendering between cold-boot and post-LSM
-    * runs.
-    *
-    * Zero them at the start of every fd2_emit_restore - cheap (~70
-    * dwords once per batch), correct, and matches what KGSL did for
-    * the same silicon.
-    */
-   {
-      const unsigned BOOL_CONSTANTS = 8;
-      const unsigned LOOP_CONSTANTS = 56;
-      unsigned i;
-
-      OUT_PKT3(ring, CP_SET_CONSTANT, 1 + BOOL_CONSTANTS);
-      OUT_RING(ring, (2 << 16) | 0); /* type=2 boolean, offset=0 */
-      for (i = 0; i < BOOL_CONSTANTS; i++)
-         OUT_RING(ring, 0x00000000);
-
-      OUT_PKT3(ring, CP_SET_CONSTANT, 1 + LOOP_CONSTANTS);
-      OUT_RING(ring, (3 << 16) | 0); /* type=3 loop, offset=0 */
-      for (i = 0; i < LOOP_CONSTANTS; i++)
-         OUT_RING(ring, 0x00000000);
-   }
-
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
    OUT_RING(ring, CP_REG(REG_A2XX_SQ_VS_CONST));
    OUT_RING(ring, A2XX_SQ_VS_CONST_BASE(VS_CONST_BASE) |
