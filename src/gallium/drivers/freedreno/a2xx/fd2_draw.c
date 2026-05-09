@@ -834,9 +834,39 @@ fd2_clear(struct fd_context *ctx, enum fd_buffer_mask buffers,
       }
    } else {
       if (buffers & FD_BUFFER_COLOR) {
-         OUT_PKT3(ring, CP_SET_CONSTANT, 2);
-         OUT_RING(ring, CP_REG(REG_A2XX_CLEAR_COLOR));
-         OUT_RING(ring, pack_rgba(PIPE_FORMAT_R8G8B8A8_UNORM, color->f));
+         /*
+          * A22X clear color path.
+          *
+          * The "solid" clear shader (freedreno_program.c:solid_fs) is:
+          *   DCL CONST[0]
+          *   MOV OUT[0], CONST[0]
+          * i.e. it outputs whatever is in fragment-shader CONST[0]
+          * (ALU type-0 vec4 constant) as the fragment color.
+          *
+          * The A20X branch correctly writes the user's clear color to
+          * PS const slot 0 via CP_SET_CONSTANT type-0 at offset 0x480
+          * (= PS_CONST_BASE*4). On A22X this previously wrote to
+          * REG_A2XX_CLEAR_COLOR (the *fast-clear* register) instead -
+          * which the solid shader never reads. The fragment color
+          * therefore came out as whatever happened to be sitting in
+          * CONST[0] from a previous draw or context (the bug surfaced
+          * as a solid-blue background on a glClearColor(0.10, 0.20,
+          * 0.30) call - direct gl-capture confirmed via pixel-diff
+          * against the legacy webOS proprietary stack on the same
+          * hardware).
+          *
+          * Match the A20X path: write the four float channels to the
+          * same PS-const-0 slot the shader actually reads. The
+          * CLEAR_COLOR register would only matter for the fast-clear
+          * code path (which short-circuits via fd2_clear_fast above
+          * and is A20X-only anyway - see line 707).
+          */
+         OUT_PKT3(ring, CP_SET_CONSTANT, 5);
+         OUT_RING(ring, 0x00000480);  /* type=0 ALU, PS_CONST_BASE*4 */
+         OUT_RING(ring, color->ui[0]);
+         OUT_RING(ring, color->ui[1]);
+         OUT_RING(ring, color->ui[2]);
+         OUT_RING(ring, color->ui[3]);
       }
 
       if (buffers & (FD_BUFFER_DEPTH | FD_BUFFER_STENCIL)) {
