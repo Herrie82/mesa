@@ -412,6 +412,26 @@ fd2_emit_restore(struct fd_context *ctx, struct fd_ringbuffer *ring)
    OUT_PKT3(ring, CP_WAIT_FOR_IDLE, 1);
    OUT_RING(ring, 0x00000000);
 
+   /*
+    * Cache flush + invalidate at batch start (A22X only).
+    *
+    * gl-capture pixel-diff experiments showed cross-process GPU-side
+    * nondeterminism on byte-identical PM4 cmdstreams (FD_RD_DUMP md5
+    * identical across runs but pixel output differs). The remaining
+    * source of run-to-run variance is GPU-internal caches retaining
+    * data from a previous submit. CACHE_FLUSH_AND_INV_EVENT drains
+    * the SQ instruction cache and shader-constant cache at batch
+    * start so each batch begins with a clean SQ state regardless
+    * of what previous submits or clients left behind.
+    *
+    * Same event is already used in fd2_draw.c with count=1, so
+    * this is the proven-safe form for A22X.
+    */
+   if (!is_a20x(ctx->screen)) {
+      OUT_PKT3(ring, CP_EVENT_WRITE, 1);
+      OUT_RING(ring, CACHE_FLUSH_AND_INV_EVENT);
+   }
+
    if (is_a20x(ctx->screen)) {
       OUT_PKT0(ring, REG_A2XX_RB_BC_CONTROL, 1);
       OUT_RING(ring, A2XX_RB_BC_CONTROL_ACCUM_TIMEOUT_SELECT(3) |
