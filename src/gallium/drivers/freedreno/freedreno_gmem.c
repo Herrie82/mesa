@@ -735,28 +735,6 @@ fd_gmem_render_tiles(struct fd_batch *batch)
    if (FD_DBG(SYSMEM))
       sysmem = true;
 
-   /*
-    * A22X (Adreno 220 / Leia) GMEM tile-binning path is currently broken
-    * on mainline freedreno. Direct gl-capture experiments on the HP TouchPad
-    * (1024x768 framebuffer, 2x2 tile layout) show:
-    *   - GMEM path: 8/10 distinct broken outputs, hard tile edges, missing
-    *     varyings on individual tiles, occasional fully-black tiles.
-    *   - sysmem path: produces correct smooth-gradient triangle.
-    * The per-tile state setup in fd2_emit_tile_renderprep is racing against
-    * the previous tile's pipeline (no CP_WAIT_FOR_IDLE between tiles), and
-    * other per-tile state restore is incomplete.
-    *
-    * Force sysmem on A22X until the GMEM tile path is fixed. Cost is
-    * ~3MB of extra memory bandwidth per frame at 1024x768/RGBA8 (we lose
-    * the on-chip GMEM tile cache), but correctness > performance for now.
-    * The visible bugs in luna-surfacemanager (yellow/orange gradient on
-    * translucent UI bars), kmscube (black faces post-LSM-kill, white
-    * rectangle behind gears), and glmark2 (faceted build/shading) all
-    * trace back to the same broken-tile-state path.
-    */
-   if (is_a22x(ctx->screen))
-      sysmem = true;
-
    /* Layered rendering always needs bypass. */
    for (unsigned i = 0; i < pfb->nr_cbufs; i++) {
       struct pipe_surface *psurf = &pfb->cbufs[i];
