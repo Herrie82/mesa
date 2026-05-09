@@ -437,6 +437,46 @@ fd2_emit_restore(struct fd_context *ctx, struct fd_ringbuffer *ring)
    OUT_PKT3(ring, CP_WAIT_FOR_IDLE, 1);
    OUT_RING(ring, 0x00000000);
 
+   /*
+    * Aggressive cache flush + invalidate at batch start (A22X only).
+    *
+    * gl-capture pixel-diff experiments isolated cross-process GPU-side
+    * nondeterminism: 10 consecutive runs of the *same* deterministic
+    * test program emit byte-identical PM4 cmdstreams (FD_RD_DUMP
+    * confirmed - md5 of all rd files is identical) but produce
+    * different pixel output. Mesa is doing its job; the hardware is
+    * producing different output for the same input across runs.
+    *
+    * The remaining sources of run-to-run variance for byte-identical
+    * cmdstreams are GPU-internal caches/SRAMs that retain data from a
+    * previous submit (potentially across processes / DRM clients):
+    *   - VPC vertex parameter cache (drained via VS_FETCH_DONE event)
+    *   - Texture/L2 caches (TC_CNTL_STATUS L2_INVALIDATE - already
+    *     present below)
+    *   - SQ instruction & shader-constant caches (CACHE_FLUSH_AND_INV
+    *     event flushes both)
+    *   - General "wait for everything to settle" between submits
+    *     (SC_WAIT_WC for write-coalesce drain)
+    *
+    * Issue the strongest A22X-available flush sequence here, before
+    * any state-restore writes, so each batch starts from a clean GPU
+    * state regardless of what previous submits or clients left
+    * behind. Cheap once-per-batch.
+    */
+   if (!is_a20x(ctx->screen)) {
+      OUT_PKT3(ring, CP_EVENT_WRITE, 1);
+      OUT_RING(ring, CACHE_FLUSH_AND_INV_EVENT);
+
+      OUT_PKT3(ring, CP_EVENT_WRITE, 1);
+      OUT_RING(ring, VS_FETCH_DONE);
+
+      OUT_PKT3(ring, CP_EVENT_WRITE, 1);
+      OUT_RING(ring, SC_WAIT_WC);
+
+      OUT_PKT3(ring, CP_WAIT_FOR_IDLE, 1);
+      OUT_RING(ring, 0x00000000);
+   }
+
    if (is_a20x(ctx->screen)) {
       OUT_PKT0(ring, REG_A2XX_RB_BC_CONTROL, 1);
       OUT_RING(ring, A2XX_RB_BC_CONTROL_ACCUM_TIMEOUT_SELECT(3) |
