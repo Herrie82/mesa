@@ -579,42 +579,16 @@ fd2_emit_restore(struct fd_context *ctx, struct fd_ringbuffer *ring)
     * dwords once per batch), correct, and matches what KGSL did for
     * the same silicon.
     */
-   /*
-    * Extension (per user empirical data 2026-05-08): bool/loop alone
-    * is not enough. The visual-bug pattern reproduces between *any*
-    * two GL clients (e.g. glmark2 run #1 → run #2, no LSM involved),
-    * so the leak is in shared shader-constant memory generally. Match
-    * what KGSL does: bulk-zero all four constant classes.
-    */
    {
-      const unsigned ALU_CONSTANTS  = 2048; /* 512 vec4 (256 VS + 256 PS) */
-      const unsigned TEX_CONSTANTS  = 192;  /* 32 samplers x 6 dwords */
-      const unsigned BOOL_CONSTANTS = 8;    /* 256 bool flags */
-      const unsigned LOOP_CONSTANTS = 56;   /* 56 loop control values */
+      const unsigned BOOL_CONSTANTS = 8;
+      const unsigned LOOP_CONSTANTS = 56;
       unsigned i;
 
-      /* type=0 ALU vec4 constants. Mesa's emit_constants() will then
-       * overwrite the slots the current shader actually uses; this
-       * sweep prevents previous-client residue in unused slots from
-       * being picked up by stray loads in compiled shaders. */
-      OUT_PKT3(ring, CP_SET_CONSTANT, 1 + ALU_CONSTANTS);
-      OUT_RING(ring, (0 << 16) | 0); /* type=0 ALU, offset=0 */
-      for (i = 0; i < ALU_CONSTANTS; i++)
-         OUT_RING(ring, 0x00000000);
-
-      /* type=1 texture/sampler descriptors. */
-      OUT_PKT3(ring, CP_SET_CONSTANT, 1 + TEX_CONSTANTS);
-      OUT_RING(ring, (1 << 16) | 0); /* type=1 texture, offset=0 */
-      for (i = 0; i < TEX_CONSTANTS; i++)
-         OUT_RING(ring, 0x00000000);
-
-      /* type=2 boolean constants. */
       OUT_PKT3(ring, CP_SET_CONSTANT, 1 + BOOL_CONSTANTS);
       OUT_RING(ring, (2 << 16) | 0); /* type=2 boolean, offset=0 */
       for (i = 0; i < BOOL_CONSTANTS; i++)
          OUT_RING(ring, 0x00000000);
 
-      /* type=3 loop constants. */
       OUT_PKT3(ring, CP_SET_CONSTANT, 1 + LOOP_CONSTANTS);
       OUT_RING(ring, (3 << 16) | 0); /* type=3 loop, offset=0 */
       for (i = 0; i < LOOP_CONSTANTS; i++)
