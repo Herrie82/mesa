@@ -876,21 +876,27 @@ fd2_emit_tile_renderprep(struct fd_batch *batch,
        * pixel-hash outputs where 1/8 is bit-exact correct and 7/8 are
        * partial tile coverage).
        *
-       * The bin_id encoding uses the same convention as the A20X
-       * hw_binning path (freedreno_gmem.c:392): bin_id = ((row+1)<<3) |
-       * (col+1), with +1 offsets so bin_id is never 0. The 0 value
-       * appears to be reserved by the binner and is the source of the
-       * cycle. By writing a valid per-tile bin_id we tell the binner
-       * exactly which tile each pass corresponds to, instead of letting
-       * its internal state decide.
+       * Encoding (revised 2026-05-11 from webOS libGLESv2.so decomp):
+       *   bin_id = (col + 1) | (row << 3)
+       *
+       * Initial v1 attempted the A20X reference encoding
+       * (((row+1) << 3) | (col+1) from freedreno_gmem.c:392) which
+       * produced no effect. Deeper analysis of the webOS proprietary
+       * decomp showed the pattern:
+       *   uVar24 = uVar27 + 1 | iVar5 * 8 | uVar24;
+       * which decodes as (col+1) | (row<<3) - col gets the +1
+       * offset, row does not. This produces bin_id=0x01 for the
+       * first tile rather than 0x09.
        *
        * For the standard 1024x768 / 2x3 tile layout this produces
-       * bin_ids 0x09, 0x0a, 0x11, 0x12, 0x19, 0x1a - all non-zero,
-       * all distinct.
+       * bin_ids 0x01, 0x02, 0x09, 0x0a, 0x11, 0x12 - all non-zero,
+       * all distinct. The (col+1) ensures the col-zero case lands
+       * on 1 instead of 0 (the "reserved" value the binner cycles
+       * around).
        */
       uint32_t col = tile->xoff / tile->bin_w;
       uint32_t row = tile->yoff / tile->bin_h;
-      uint32_t bin_id = ((row + 1) << 3) | (col + 1);
+      uint32_t bin_id = (col + 1) | (row << 3);
 
       OUT_PKT3(ring, CP_SET_CONSTANT, 2);
       OUT_RING(ring, CP_REG(REG_A2XX_VGT_CURRENT_BIN_ID_MIN));
