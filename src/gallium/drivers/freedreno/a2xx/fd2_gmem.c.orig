@@ -55,11 +55,10 @@ use_hw_binning(struct fd_batch *batch)
    if (gmem->num_vsc_pipes > 8 || !gmem->num_vsc_pipes)
       return false;
 
-   /* A20X uses shader-memexport-based binning; A22X uses the HW binner
-    * engaged by LRZ_VSC_CONTROL=3 + the prelude in the A22X branch below.
-    * Both reuse the same per-pipe VSC_PIPE BO infrastructure.
+   /* only a20x hw binning is implement
+    * a22x is more like a3xx, but perhaps the a20x works? (TODO)
     */
-   if (!is_a20x(batch->ctx->screen) && !is_a22x(batch->ctx->screen))
+   if (!is_a20x(batch->ctx->screen))
       return false;
 
    return fd_binning_enabled && ((gmem->nbins_x * gmem->nbins_y) > 2);
@@ -557,243 +556,85 @@ fd2_emit_tile_init(struct fd_batch *batch) assert_dt
       OUT_RING(ring, 0);
    }
 
-   /* A22X hw binning prelude (Fork D + Fork A/B integration 2026-05-11)
-    *
-    * Only emit when we're actually going to run the binning IB
-    * (use_hw_binning true). Without the IB, engaging the binner
-    * with no work would hang.
-    *
-    * Emit the binning state setup matching webOS proprietary libGLESv2.so
-    * leia_configure_binning_pass (decomp @ 0x124a50):
-    *   1. VSC_BIN_SIZE  -- tile dimensions in 32px units
-    *   2. VSC_PIPE[0..7] CONFIG + DATA_ADDRESS + DATA_LENGTH for 8 pipes
-    *   3. A220_VSC_ENABLE @ 0xC00 = 1   (undocumented master enable)
-    *   4. A220_RB_LRZ_VSC_CONTROL = 3   (engage the binner)
-    *
-    * Phase 0 (LRZ_VSC_CONTROL=3 alone) collapsed the 8-cycle to 1 hash but
-    * hung the GPU because the binner had nowhere to write. This block adds
-    * the pipe BOs + VSC config so the binner has buffers, removing the hang.
-    *
-    * Fork C intentionally does NOT emit:
-    *   - SQ_GPR_MANAGEMENT = 0x7f010 (binning shader register partition).
-    *     We use the regular VS+PS shaders for both binning and rendering,
-    *     so the shader's own SQ_PROGRAM_CNTL handling stays in effect.
-    *   - A separate binning shader variant or two-pass rendering. The
-    *     binner produces visibility data passively during the normal
-    *     draw stream; tile filtering relies on the per-tile BIN_ID
-    *     writes from patch 0090.
-    *
-    * Reference: reports/a22x-hw-binning-port-analysis.md (sections 1-4).
-    */
-   if (is_a22x(ctx->screen) && use_hw_binning(batch)) {
-      const unsigned num_pipes = 8;
-
-      /* Allocate one 256KB VSC pipe BO per pipe (matches webOS initial
-       * allocation in leia_binning_grow_vis_stream_buffer). Buffers are
-       * reused across batches; grown lazily if a future patch tracks
-       * pipe data length overflow.
-       */
-      for (int i = 0; i < num_pipes; i++) {
-         if (!ctx->vsc_pipe_bo[i]) {
-            ctx->vsc_pipe_bo[i] = fd_bo_new(ctx->dev, 0x40000, 0,
-                                            "a22x_vsc_pipe[%u]", i);
-            assert(ctx->vsc_pipe_bo[i]);
-         }
-      }
-
-      /* VSC_BIN_SIZE: bin_w / bin_h in 32-pixel units.
-       *
-       * NOTE: VSC registers live at 0x0C00..0x0C1D which is BELOW the
-       * 3D state block (0x2000-0x2FFF) that CP_SET_CONSTANT uses. Mesa's
-       * CP_REG() macro does (reg - 0x2000) and only works for registers
-       * >= 0x2000. For VSC registers we must use raw PM4 type-0 packets
-       * via OUT_PKT0. webOS does the same (type-0 packet 0x170c06 for
-       * the 24-reg VSC_PIPE block, 0x000c00 for the master enable).
-       */
-      OUT_PKT0(ring, REG_A2XX_A220_VSC_BIN_SIZE, 1);
-      OUT_RING(ring, A2XX_A220_VSC_BIN_SIZE_WIDTH(gmem->bin_w) |
-                     A2XX_A220_VSC_BIN_SIZE_HEIGHT(gmem->bin_h));
-
-      /* VSC_PIPE[0..7]: 24 consecutive regs at 0xC06 (CONFIG, ADDRESS, LENGTH)
-       * CONFIG encoding from webOS decomp: (h<<24)|(w<<20)|(y<<10)|x.
-       * Bit layout independently verified against documented A3XX
-       * VSC_PIPE_CONFIG (X[0:9], Y[10:19], W[20:23], H[24:27]).
-       */
-      OUT_PKT0(ring, REG_A2XX_VSC_PIPE_CONFIG(0), num_pipes * 3);
-      for (int i = 0; i < num_pipes; i++) {
-         const struct fd_vsc_pipe *pipe = &gmem->vsc_pipe[i];
-         uint32_t config = ((pipe->h & 0xf) << 24) |
-                           ((pipe->w & 0xf) << 20) |
-                           ((pipe->y & 0x3ff) << 10) |
-                           (pipe->x & 0x3ff);
-         OUT_RING(ring, config);
-         OUT_RELOC(ring, ctx->vsc_pipe_bo[i], 0, 0, 0);
-         OUT_RING(ring, fd_bo_size(ctx->vsc_pipe_bo[i]));
-      }
-
-      /* Explicit disengage of any previously-engaged binner before
-       * re-engaging in this batch.
-       *
-       * Hangs investigation 2026-05-11: with FD2_VSC_DUMP=1 enabling
-       * double-render mode, every gl-cap invocation hangs on the
-       * second batch's submission. netconsole shows fence delta = 1
-       * across 62 hangchecks (batch N+1 hangs every time). Cause:
-       * the binner stays engaged across batches; the second batch's
-       * LRZ_VSC_CONTROL=3 write on an already-engaged binner deadlocks.
-       *
-       * clear_state_restore writes LRZ_VSC_CONTROL=0 at batch start but
-       * that path may not include a WFI, so the disengage doesn't commit
-       * before our prelude runs. Force a clean disengage with explicit
-       * WFI here so the engage that follows starts from a known state.
-       */
-      OUT_PKT3(ring, CP_SET_CONSTANT, 2);
-      OUT_RING(ring, CP_REG(REG_A2XX_A220_RB_LRZ_VSC_CONTROL));
-      OUT_RING(ring, 0x00000000);
-      OUT_WFI(ring);
-
-      /* A220_VSC_ENABLE @ 0xC00 = 1 -- undocumented master enable.
-       * webOS writes this via a type-0 PM4 packet. The register is not
-       * in a2xx.xml so we use the raw address.
-       */
-      OUT_PKT0(ring, 0xC00, 1);
-      OUT_RING(ring, 1);
-
-      /* Engage the binner: A220_RB_LRZ_VSC_CONTROL = 3 (webOS value).
-       * WFI follows immediately after, per webOS ordering — earlier v2
-       * placed WFI BEFORE this write which was the wrong position.
-       */
-      OUT_PKT3(ring, CP_SET_CONSTANT, 2);
-      OUT_RING(ring, CP_REG(REG_A2XX_A220_RB_LRZ_VSC_CONTROL));
-      OUT_RING(ring, 0x00000003);
-
-      OUT_WFI(ring);
-
-      /* Fork D: pulse SQ_GPR_MANAGEMENT to the binning shader partition
-       * (REG_SIZE_VTX=127, REG_SIZE_PIX=1, REG_DYNAMIC=0) then restore
-       * to Mesa's dynamic value (0x00040401 = VS=64/PS=64 dynamic) so
-       * the regular VS+PS shaders that run for the actual draws have
-       * enough register budget.
-       *
-       * Hypothesis (Phase 1 analysis section 9, and 2c65153c "5/6 correct"
-       * observation): the A22X binner samples SQ_GPR_MANAGEMENT at engage
-       * time to define wavefront-slot boundaries for its visibility
-       * stream. With an unbounded/random initial value, the slot pointer
-       * rotates through 8 stable mis-indexed states (the period-8 cycle).
-       * Pulsing the boundary at engage clamps the slot allocator. Restore
-       * before draws ensures PS has the GPRs it needs.
-       *
-       * webOS writes this AFTER LRZ_VSC_CONTROL=3 + WFI without an
-       * explicit restore in the binning_pass cmdbuf — but webOS's render-
-       * pass shader load (rb_gpuprogram_loadexecutable_internal) emits
-       * its own SQ_GPR_MANAGEMENT for the real shader. Mesa's regular
-       * shader path doesn't re-emit SQ_GPR_MANAGEMENT per draw, so we
-       * restore here.
-       */
-      OUT_PKT0(ring, REG_A2XX_SQ_GPR_MANAGEMENT, 1);
-      OUT_RING(ring, 0x0007f010);   /* VTX=127, PIX=1, static */
-
-      OUT_WFI(ring);
-
-      OUT_PKT0(ring, REG_A2XX_SQ_GPR_MANAGEMENT, 1);
-      OUT_RING(ring, 0x00040401);   /* VS=64, PS=64, REG_DYNAMIC=1 */
-   }
-
    if (use_hw_binning(batch)) {
+      /* patch out unneeded memory exports by changing EXEC CF to EXEC_END
+       *
+       * in the shader compiler, we guarantee that the shader ends with
+       * a specific pattern of ALLOC/EXEC CF pairs for the hw binning exports
+       *
+       * the since patches point only to dwords and CFs are 1.5 dwords
+       * the patch is aligned and might point to a ALLOC CF
+       */
+      for (int i = 0; i < batch->shader_patches.size / sizeof(void *); i++) {
+         instr_cf_t *cf =
+            *util_dynarray_element(&batch->shader_patches, instr_cf_t *, i);
+         if (cf->opc == ALLOC)
+            cf++;
+         assert(cf->opc == EXEC);
+         assert(cf[ctx->screen->info->num_vsc_pipes * 2 - 2].opc == EXEC_END);
+         cf[2 * (gmem->num_vsc_pipes - 1)].opc = EXEC_END;
+      }
+
       patch_draws(batch, USE_VISIBILITY);
 
-      if (is_a20x(ctx->screen)) {
-         /* A20X hw binning: shader-memexport mechanism.
-          *
-          * Patch out unneeded memory exports by changing EXEC CF to EXEC_END.
-          * In the shader compiler, we guarantee that the shader ends with
-          * a specific pattern of ALLOC/EXEC CF pairs for the hw binning exports.
-          *
-          * The patches point only to dwords and CFs are 1.5 dwords so the
-          * patch is aligned and might point to an ALLOC CF.
+      /* initialize shader constants for the binning memexport */
+      OUT_PKT3(ring, CP_SET_CONSTANT, 1 + gmem->num_vsc_pipes * 4);
+      OUT_RING(ring, 0x0000000C);
+
+      for (int i = 0; i < gmem->num_vsc_pipes; i++) {
+         /* allocate in 64k increments to avoid reallocs */
+         uint32_t bo_size = align(batch->num_vertices, 0x10000);
+         if (!ctx->vsc_pipe_bo[i] ||
+             fd_bo_size(ctx->vsc_pipe_bo[i]) < bo_size) {
+            if (ctx->vsc_pipe_bo[i])
+               fd_bo_del(ctx->vsc_pipe_bo[i]);
+            ctx->vsc_pipe_bo[i] =
+               fd_bo_new(ctx->dev, bo_size, 0, "vsc_pipe[%u]", i);
+            assert(ctx->vsc_pipe_bo[i]);
+         }
+
+         /* memory export address (export32):
+          * .x: (base_address >> 2) | 0x40000000 (?)
+          * .y: index (float) - set by shader
+          * .z: 0x4B00D000 (?)
+          * .w: 0x4B000000 (?) | max_index (?)
           */
-         for (int i = 0; i < batch->shader_patches.size / sizeof(void *); i++) {
-            instr_cf_t *cf =
-               *util_dynarray_element(&batch->shader_patches, instr_cf_t *, i);
-            if (cf->opc == ALLOC)
-               cf++;
-            assert(cf->opc == EXEC);
-            assert(cf[ctx->screen->info->num_vsc_pipes * 2 - 2].opc == EXEC_END);
-            cf[2 * (gmem->num_vsc_pipes - 1)].opc = EXEC_END;
-         }
-
-         /* initialize shader constants for the binning memexport */
-         OUT_PKT3(ring, CP_SET_CONSTANT, 1 + gmem->num_vsc_pipes * 4);
-         OUT_RING(ring, 0x0000000C);
-
-         for (int i = 0; i < gmem->num_vsc_pipes; i++) {
-            /* allocate in 64k increments to avoid reallocs */
-            uint32_t bo_size = align(batch->num_vertices, 0x10000);
-            if (!ctx->vsc_pipe_bo[i] ||
-                fd_bo_size(ctx->vsc_pipe_bo[i]) < bo_size) {
-               if (ctx->vsc_pipe_bo[i])
-                  fd_bo_del(ctx->vsc_pipe_bo[i]);
-               ctx->vsc_pipe_bo[i] =
-                  fd_bo_new(ctx->dev, bo_size, 0, "vsc_pipe[%u]", i);
-               assert(ctx->vsc_pipe_bo[i]);
-            }
-
-            /* memory export address (export32):
-             * .x: (base_address >> 2) | 0x40000000 (?)
-             * .y: index (float) - set by shader
-             * .z: 0x4B00D000 (?)
-             * .w: 0x4B000000 (?) | max_index (?)
-             */
-            OUT_RELOC(ring, ctx->vsc_pipe_bo[i], 0, 0x40000000, -2);
-            OUT_RING(ring, 0x00000000);
-            OUT_RING(ring, 0x4B00D000);
-            OUT_RING(ring, 0x4B000000 | bo_size);
-         }
-
-         OUT_PKT3(ring, CP_SET_CONSTANT, 1 + gmem->num_vsc_pipes * 8);
-         OUT_RING(ring, 0x0000018C);
-
-         for (int i = 0; i < gmem->num_vsc_pipes; i++) {
-            const struct fd_vsc_pipe *pipe = &gmem->vsc_pipe[i];
-            float off_x, off_y, mul_x, mul_y;
-
-            /* const to tranform from [-1,1] to bin coordinates for this pipe
-             * for x/y, [0,256/2040] = 0, [256/2040,512/2040] = 1, etc
-             * 8 possible values on x/y axis,
-             * to clip at binning stage: only use center 6x6
-             * TODO: set the z parameters too so that hw binning
-             * can clip primitives in Z too
-             */
-
-            mul_x = 1.0f / (float)(gmem->bin_w * 8);
-            mul_y = 1.0f / (float)(gmem->bin_h * 8);
-            off_x = -pipe->x * (1.0f / 8.0f) + 0.125f - mul_x * gmem->minx;
-            off_y = -pipe->y * (1.0f / 8.0f) + 0.125f - mul_y * gmem->miny;
-
-            OUT_RING(ring, fui(off_x * (256.0f / 255.0f)));
-            OUT_RING(ring, fui(off_y * (256.0f / 255.0f)));
-            OUT_RING(ring, 0x3f000000);
-            OUT_RING(ring, fui(0.0f));
-
-            OUT_RING(ring, fui(mul_x * (256.0f / 255.0f)));
-            OUT_RING(ring, fui(mul_y * (256.0f / 255.0f)));
-            OUT_RING(ring, fui(0.0f));
-            OUT_RING(ring, fui(0.0f));
-         }
+         OUT_RELOC(ring, ctx->vsc_pipe_bo[i], 0, 0x40000000, -2);
+         OUT_RING(ring, 0x00000000);
+         OUT_RING(ring, 0x4B00D000);
+         OUT_RING(ring, 0x4B000000 | bo_size);
       }
-      /* For A22X, the hw binner produces visibility data itself. The
-       * BO allocation + VSC_PIPE_CONFIG + LRZ_VSC_CONTROL=3 prelude
-       * happens earlier in this function (Fork D block). The binning
-       * IB below will run while the binner is engaged.
-       *
-       * Note: A22X's binning shader (ir2 variant 0) still has the 8
-       * memexport CFs from extra_position_exports() in ir2_nir.c.
-       * Without A20X's memexport address constants (skipped above),
-       * those CFs would write to undefined addresses. For now we don't
-       * skip them — the HW binner is the actual visibility producer;
-       * the memexport CFs are stray writes that may corrupt memory but
-       * shouldn't change rasterization. This is a known issue to fix
-       * in a follow-up (modify ir2_nir.c to skip memexport for A22X).
-       */
+
+      OUT_PKT3(ring, CP_SET_CONSTANT, 1 + gmem->num_vsc_pipes * 8);
+      OUT_RING(ring, 0x0000018C);
+
+      for (int i = 0; i < gmem->num_vsc_pipes; i++) {
+         const struct fd_vsc_pipe *pipe = &gmem->vsc_pipe[i];
+         float off_x, off_y, mul_x, mul_y;
+
+         /* const to tranform from [-1,1] to bin coordinates for this pipe
+          * for x/y, [0,256/2040] = 0, [256/2040,512/2040] = 1, etc
+          * 8 possible values on x/y axis,
+          * to clip at binning stage: only use center 6x6
+          * TODO: set the z parameters too so that hw binning
+          * can clip primitives in Z too
+          */
+
+         mul_x = 1.0f / (float)(gmem->bin_w * 8);
+         mul_y = 1.0f / (float)(gmem->bin_h * 8);
+         off_x = -pipe->x * (1.0f / 8.0f) + 0.125f - mul_x * gmem->minx;
+         off_y = -pipe->y * (1.0f / 8.0f) + 0.125f - mul_y * gmem->miny;
+
+         OUT_RING(ring, fui(off_x * (256.0f / 255.0f)));
+         OUT_RING(ring, fui(off_y * (256.0f / 255.0f)));
+         OUT_RING(ring, 0x3f000000);
+         OUT_RING(ring, fui(0.0f));
+
+         OUT_RING(ring, fui(mul_x * (256.0f / 255.0f)));
+         OUT_RING(ring, fui(mul_y * (256.0f / 255.0f)));
+         OUT_RING(ring, fui(0.0f));
+         OUT_RING(ring, fui(0.0f));
+      }
 
       OUT_PKT3(ring, CP_SET_CONSTANT, 2);
       OUT_RING(ring, CP_REG(REG_A2XX_VGT_VERTEX_REUSE_BLOCK_CNTL));
@@ -804,18 +645,6 @@ fd2_emit_tile_init(struct fd_batch *batch) assert_dt
       OUT_PKT3(ring, CP_SET_CONSTANT, 2);
       OUT_RING(ring, CP_REG(REG_A2XX_VGT_VERTEX_REUSE_BLOCK_CNTL));
       OUT_RING(ring, 0x00000002);
-
-      if (is_a22x(ctx->screen)) {
-         /* Disengage the A22X HW binner after the binning IB has run.
-          * Subsequent per-tile rendering uses the visibility data the
-          * binner wrote to VSC_PIPE BOs, but the binner itself should
-          * not be re-engaged for render-pass draws.
-          */
-         OUT_PKT3(ring, CP_SET_CONSTANT, 2);
-         OUT_RING(ring, CP_REG(REG_A2XX_A220_RB_LRZ_VSC_CONTROL));
-         OUT_RING(ring, 0x00000000);
-         OUT_WFI(ring);
-      }
    } else {
       patch_draws(batch, IGNORE_VISIBILITY);
    }
