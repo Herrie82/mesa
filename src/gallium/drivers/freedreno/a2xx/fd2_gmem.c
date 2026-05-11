@@ -657,14 +657,24 @@ fd2_emit_tile_init(struct fd_batch *batch) assert_dt
    }
    util_dynarray_clear(&batch->gmem_patches);
 
-   /* set to zero, for some reason hardware doesn't like certain values */
-   OUT_PKT3(ring, CP_SET_CONSTANT, 2);
-   OUT_RING(ring, CP_REG(REG_A2XX_VGT_CURRENT_BIN_ID_MIN));
-   OUT_RING(ring, 0);
+   /* set to zero, for some reason hardware doesn't like certain values
+    *
+    * A22X: skip the zero-write. The 0-value-is-bad warning in the
+    * original comment is real - the A22X hardware binner enters a
+    * cycling-state-machine mode when BIN_ID=0, producing the period-8
+    * tile-coverage cycle. Per-tile non-zero BIN_ID writes happen in
+    * fd2_emit_tile_renderprep below; let those be the only writes so
+    * the binner never sees BIN_ID=0.
+    */
+   if (!is_a22x(ctx->screen)) {
+      OUT_PKT3(ring, CP_SET_CONSTANT, 2);
+      OUT_RING(ring, CP_REG(REG_A2XX_VGT_CURRENT_BIN_ID_MIN));
+      OUT_RING(ring, 0);
 
-   OUT_PKT3(ring, CP_SET_CONSTANT, 2);
-   OUT_RING(ring, CP_REG(REG_A2XX_VGT_CURRENT_BIN_ID_MAX));
-   OUT_RING(ring, 0);
+      OUT_PKT3(ring, CP_SET_CONSTANT, 2);
+      OUT_RING(ring, CP_REG(REG_A2XX_VGT_CURRENT_BIN_ID_MAX));
+      OUT_RING(ring, 0);
+   }
 
    if (use_hw_binning(batch)) {
       /* patch out unneeded memory exports by changing EXEC CF to EXEC_END
