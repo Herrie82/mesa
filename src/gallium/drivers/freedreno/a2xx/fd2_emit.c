@@ -717,24 +717,39 @@ fd2_emit_restore(struct fd_context *ctx, struct fd_ringbuffer *ring)
       mesa_logi("A2XX: SQ_GPR_MANAGEMENT=0x00040401 (VS=64 PS=64 + REG_DYNAMIC)");
    }
 
-   OUT_PKT0(ring, REG_A2XX_SQ_INST_STORE_MANAGMENT, 1);
-   OUT_RING(ring, 0x00000180);
-
-   /* Debug: Log instruction store management. */
-   if (FD_DBG(MSGS)) {
-      mesa_logi("A2XX: SQ_INST_STORE_MANAGMENT=0x00000180");
-   }
-
    /* NOTE: SQ_PIX_IN_CNTL (0x0d0c) and SQ_RESOURCE_MANAGMENT (0x0d03) are
     * Leia-specific registers defined in KGSL but writing to them causes
     * GPU hang. DO NOT initialize these registers.
     */
 
+   /* Re-ordered SQ inst-store partition sequence (A22X 8-cycle experiment).
+    *
+    * Match legacy KGSL build_shader_save_restore_cmds() restore path
+    * (drivers/gpu/msm/kgsl_drawctxt.c lines 1305-1339): invalidate first,
+    * then set bases, then commit partition LAST. Mesa previously wrote the
+    * partition first, then invalidated, then set bases - the invalidate
+    * may have been clobbering the partition before it took effect, leaving
+    * the SQ wavefront slot allocator in an inconsistent state across
+    * submissions. The deterministic 8-hash cycle observed on A22X is the
+    * suspected symptom. Pure reorder, no value changes.
+    *
+    * Reference: webOS libGLESv2 leia_repartition_instruction_store()
+    * emits the same INVALIDATE -> SET_SHADER_BASES -> SQ_INST_STORE_MANAGMENT
+    * sequence (decompiled @ 0x001389f0). The vendor proprietary drivers
+    * (HTC/Samsung/Xiaomi adreno200 libGLESv2) follow the same order.
+    */
    OUT_PKT3(ring, CP_INVALIDATE_STATE, 1);
    OUT_RING(ring, 0x00000300);
 
    OUT_PKT3(ring, CP_SET_SHADER_BASES, 1);
    OUT_RING(ring, 0x80000180);
+
+   OUT_PKT0(ring, REG_A2XX_SQ_INST_STORE_MANAGMENT, 1);
+   OUT_RING(ring, 0x00000180);
+
+   if (FD_DBG(MSGS)) {
+      mesa_logi("A2XX: SQ_INST_STORE_MANAGMENT=0x00000180 (post-reorder)");
+   }
 
    /* not sure what this form of CP_SET_CONSTANT is.. */
    OUT_PKT3(ring, CP_SET_CONSTANT, 13);
