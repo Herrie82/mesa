@@ -850,6 +850,45 @@ fd2_emit_tile_renderprep(struct fd_batch *batch,
       /* TODO only emit this when tile->p changes */
       OUT_PKT3(ring, CP_SET_DRAW_INIT_FLAGS, 1);
       OUT_RELOC(ring, pipe_bo, 0, 0, 0);
+   } else if (is_a22x(ctx->screen)) {
+      /*
+       * A22X period-8 render-cycle fix: explicitly write per-tile bin ID.
+       *
+       * Without hardware binning enabled (use_hw_binning() returns false
+       * for A22X - "TODO" in this file), Mesa previously left
+       * VGT_CURRENT_BIN_ID_MIN = MAX = 0 throughout the tile loop (set
+       * once in fd2_emit_tile_init with the comment "for some reason
+       * hardware doesn't like certain values"). The A22X hardware binner
+       * is nevertheless active under the hood; with bin_id pinned at 0
+       * it uses some internal-counter state to decide tile coverage,
+       * producing a deterministic 8-pattern visibility cycle observed
+       * across many investigations (see reports/ pattern of 8 distinct
+       * pixel-hash outputs where 1/8 is bit-exact correct and 7/8 are
+       * partial tile coverage).
+       *
+       * The bin_id encoding uses the same convention as the A20X
+       * hw_binning path (freedreno_gmem.c:392): bin_id = ((row+1)<<3) |
+       * (col+1), with +1 offsets so bin_id is never 0. The 0 value
+       * appears to be reserved by the binner and is the source of the
+       * cycle. By writing a valid per-tile bin_id we tell the binner
+       * exactly which tile each pass corresponds to, instead of letting
+       * its internal state decide.
+       *
+       * For the standard 1024x768 / 2x3 tile layout this produces
+       * bin_ids 0x09, 0x0a, 0x11, 0x12, 0x19, 0x1a - all non-zero,
+       * all distinct.
+       */
+      uint32_t col = tile->xoff / tile->bin_w;
+      uint32_t row = tile->yoff / tile->bin_h;
+      uint32_t bin_id = ((row + 1) << 3) | (col + 1);
+
+      OUT_PKT3(ring, CP_SET_CONSTANT, 2);
+      OUT_RING(ring, CP_REG(REG_A2XX_VGT_CURRENT_BIN_ID_MIN));
+      OUT_RING(ring, bin_id);
+
+      OUT_PKT3(ring, CP_SET_CONSTANT, 2);
+      OUT_RING(ring, CP_REG(REG_A2XX_VGT_CURRENT_BIN_ID_MAX));
+      OUT_RING(ring, bin_id);
    }
 }
 
