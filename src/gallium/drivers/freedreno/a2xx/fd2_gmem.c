@@ -474,7 +474,30 @@ fd2_emit_tile_init(struct fd_batch *batch) assert_dt
    enum pipe_format format = pipe_surface_format(&pfb->cbufs[0]);
    uint32_t reg;
 
+   /* DIAGNOSTIC: CP_SCRATCH milestone markers for hang localization.
+    *
+    * a2xx_recover() in the kernel dumps SCRATCH_REG0..7 when hangcheck
+    * fires. By writing distinctive values at key points in the cmdstream
+    * we can see how far the CP got before the hang.
+    *
+    *   REG0=0x10001 entered fd2_emit_tile_init
+    *   REG1=0x10002 after fd2_emit_restore returned
+    *   REG2=0x10003 after Fork D prelude (binner engaged)
+    *   REG3=0x10004 just before fd2_emit_ib(batch->binning)
+    *   REG4=0x10005 just after fd2_emit_ib(batch->binning)
+    *   REG5=0x10006 after binner disengage (LRZ_VSC_CONTROL=0)
+    *   REG6=0x10007 end of fd2_emit_tile_init
+    *
+    * Any SCRATCH_REG[N] that's 0 in the kernel hang dump means the CP
+    * did not reach that milestone.
+    */
+   OUT_PKT0(ring, REG_AXXX_CP_SCRATCH_REG0, 1);
+   OUT_RING(ring, 0x10001);
+
    fd2_emit_restore(ctx, ring);
+
+   OUT_PKT0(ring, REG_AXXX_CP_SCRATCH_REG1, 1);
+   OUT_RING(ring, 0x10002);
 
    prepare_tile_fini_ib(batch);
 
@@ -733,6 +756,10 @@ fd2_emit_tile_init(struct fd_batch *batch) assert_dt
 
       OUT_PKT0(ring, REG_A2XX_SQ_GPR_MANAGEMENT, 1);
       OUT_RING(ring, 0x00040401);   /* VS=64, PS=64, REG_DYNAMIC=1 */
+
+      /* DIAGNOSTIC: marker 3 = passed Fork D prelude */
+      OUT_PKT0(ring, REG_AXXX_CP_SCRATCH_REG2, 1);
+      OUT_RING(ring, 0x10003);
    }
 
    if (use_hw_binning(batch)) {
@@ -836,7 +863,15 @@ fd2_emit_tile_init(struct fd_batch *batch) assert_dt
       OUT_RING(ring, CP_REG(REG_A2XX_VGT_VERTEX_REUSE_BLOCK_CNTL));
       OUT_RING(ring, 0);
 
+      /* DIAGNOSTIC: marker 4 = about to dispatch binning IB */
+      OUT_PKT0(ring, REG_AXXX_CP_SCRATCH_REG3, 1);
+      OUT_RING(ring, 0x10004);
+
       fd2_emit_ib(ring, batch->binning);
+
+      /* DIAGNOSTIC: marker 5 = binning IB returned */
+      OUT_PKT0(ring, REG_AXXX_CP_SCRATCH_REG4, 1);
+      OUT_RING(ring, 0x10005);
 
       OUT_PKT3(ring, CP_SET_CONSTANT, 2);
       OUT_RING(ring, CP_REG(REG_A2XX_VGT_VERTEX_REUSE_BLOCK_CNTL));
@@ -852,10 +887,18 @@ fd2_emit_tile_init(struct fd_batch *batch) assert_dt
          OUT_RING(ring, CP_REG(REG_A2XX_A220_RB_LRZ_VSC_CONTROL));
          OUT_RING(ring, 0x00000000);
          OUT_WFI(ring);
+
+         /* DIAGNOSTIC: marker 6 = disengage complete */
+         OUT_PKT0(ring, REG_AXXX_CP_SCRATCH_REG5, 1);
+         OUT_RING(ring, 0x10006);
       }
    } else {
       patch_draws(batch, IGNORE_VISIBILITY);
    }
+
+   /* DIAGNOSTIC: marker 7 = end of fd2_emit_tile_init */
+   OUT_PKT0(ring, REG_AXXX_CP_SCRATCH_REG6, 1);
+   OUT_RING(ring, 0x10007);
 
    util_dynarray_clear(&batch->draw_patches);
    util_dynarray_clear(&batch->shader_patches);
