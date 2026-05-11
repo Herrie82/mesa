@@ -593,9 +593,27 @@ clear_state_restore(struct fd_context *ctx, struct fd_ringbuffer *ring)
    OUT_RING(ring, CP_REG(REG_A2XX_RB_COPY_CONTROL));
    OUT_RING(ring, 0x00000000);
 
+   /*
+    * Phase 0 hw-binning experiment (2026-05-11): set LRZ_VSC_CONTROL=0x03
+    * instead of 0 after the clear_fast path.
+    *
+    * The closed-source webOS libGLESv2 leia_configure_binning_pass writes
+    * 0x03 to this register during the binning pass on A22X (decompile @
+    * 0x00134a50). Mesa upstream writes 0 here ("disabled"), leaving the
+    * A22X binner in an undefined-residue mode that cycles through 8
+    * tile-coverage patterns per submit (the long-standing period-8 bug).
+    *
+    * Bit decomposition (undocumented in a2xx.xml):
+    *   0x00 = no bits (Mesa "disabled")
+    *   0x03 = bits 0+1 (webOS binning-active)
+    *   0x84 = bits 2+7 (Mesa clear pass)
+    *
+    * If 0x03 collapses the cycle, the binner just needed the right mode
+    * bits set rather than a full hw-binning port.
+    */
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
    OUT_RING(ring, CP_REG(REG_A2XX_A220_RB_LRZ_VSC_CONTROL));
-   OUT_RING(ring, 0x00000000);
+   OUT_RING(ring, 0x00000003);
 
    /*
     * Restore VGT_VERTEX_REUSE_BLOCK_CNTL after the clear_fast path.
