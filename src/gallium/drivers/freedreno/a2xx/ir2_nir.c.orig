@@ -890,19 +890,6 @@ extra_position_exports(struct ir2_context *ctx, bool binning)
    if (!binning)
       return;
 
-   /* A20X hw binning emits the visibility stream via 8 shader memexport
-    * CFs (one per VSC pipe). The CFs reference shader constants 3..10 and
-    * 67..82 which fd2_gmem.c populates with pipe BO addresses + clip
-    * transforms in the A20X branch of use_hw_binning.
-    *
-    * A22X uses the hardware binner (engaged via LRZ_VSC_CONTROL=3) which
-    * writes visibility data itself. Emitting these CFs on A22X writes to
-    * undefined memory because the A20X memexport address constants are
-    * skipped. Skip them entirely for A22X binning shaders.
-    */
-   if (!ctx->so->is_a20x)
-      return;
-
    off = instr_create_alu(ctx, nir_op_fadd, 1);
    off->src[0] = ir2_src(64, 0, IR2_SRC_CONST);
    off->src[1] = ir2_src(2, 0, IR2_SRC_INPUT);
