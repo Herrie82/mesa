@@ -588,6 +588,43 @@ fd2_emit_tile_init(struct fd_batch *batch) assert_dt
    if (is_a22x(ctx->screen) && use_hw_binning(batch)) {
       const unsigned num_pipes = 8;
 
+      /* DIAGNOSTIC: dump VSC pipe BO contents from the PREVIOUS batch
+       * (which contains the binner's visibility stream output for that
+       * batch's tile geometry) before we re-use the BOs for this batch.
+       *
+       * Enabled when env var FD2_VSC_DUMP is set. First batch in a
+       * process will dump zeros (BOs freshly allocated below); the
+       * second and subsequent batches will see the prior binner output.
+       *
+       * Output: /tmp/vsc_pipe<P>_batch<N>.dump (first 4KB per pipe).
+       *
+       * Used to determine whether the period-8 render cycle has its
+       * source in the binner (different VSC byte content per phase)
+       * or downstream (rasterizer/RB processing same binner data
+       * differently each cycle).
+       */
+      static int dump_batch_counter = 0;
+      if (getenv("FD2_VSC_DUMP")) {
+         for (int i = 0; i < num_pipes; i++) {
+            if (!ctx->vsc_pipe_bo[i])
+               continue;
+            /* Wait for GPU to finish any pending writes to this BO. */
+            fd_bo_cpu_prep(ctx->vsc_pipe_bo[i], ctx->pipe, FD_BO_PREP_READ);
+            void *map = fd_bo_map(ctx->vsc_pipe_bo[i]);
+            if (!map)
+               continue;
+            char path[64];
+            snprintf(path, sizeof(path), "/tmp/vsc_pipe%d_batch%d.dump",
+                     i, dump_batch_counter);
+            FILE *f = fopen(path, "wb");
+            if (f) {
+               fwrite(map, 4096, 1, f);
+               fclose(f);
+            }
+         }
+         dump_batch_counter++;
+      }
+
       /* Allocate one 256KB VSC pipe BO per pipe (matches webOS initial
        * allocation in leia_binning_grow_vis_stream_buffer). Buffers are
        * reused across batches; grown lazily if a future patch tracks
