@@ -541,14 +541,20 @@ fd2_emit_tile_init(struct fd_batch *batch) assert_dt
    }
    util_dynarray_clear(&batch->gmem_patches);
 
-   /* set to zero, for some reason hardware doesn't like certain values */
-   OUT_PKT3(ring, CP_SET_CONSTANT, 2);
-   OUT_RING(ring, CP_REG(REG_A2XX_VGT_CURRENT_BIN_ID_MIN));
-   OUT_RING(ring, 0);
+   /* set to zero, for some reason hardware doesn't like certain values
+    *
+    * A22X: skip the zero-write. Per-tile non-zero BIN_ID writes happen
+    * in fd2_emit_tile_renderprep below; let those be the only writes.
+    */
+   if (!is_a22x(ctx->screen)) {
+      OUT_PKT3(ring, CP_SET_CONSTANT, 2);
+      OUT_RING(ring, CP_REG(REG_A2XX_VGT_CURRENT_BIN_ID_MIN));
+      OUT_RING(ring, 0);
 
-   OUT_PKT3(ring, CP_SET_CONSTANT, 2);
-   OUT_RING(ring, CP_REG(REG_A2XX_VGT_CURRENT_BIN_ID_MAX));
-   OUT_RING(ring, 0);
+      OUT_PKT3(ring, CP_SET_CONSTANT, 2);
+      OUT_RING(ring, CP_REG(REG_A2XX_VGT_CURRENT_BIN_ID_MAX));
+      OUT_RING(ring, 0);
+   }
 
    if (use_hw_binning(batch)) {
       /* patch out unneeded memory exports by changing EXEC CF to EXEC_END
@@ -729,6 +735,23 @@ fd2_emit_tile_renderprep(struct fd_batch *batch,
       /* TODO only emit this when tile->p changes */
       OUT_PKT3(ring, CP_SET_DRAW_INIT_FLAGS, 1);
       OUT_RELOC(ring, pipe_bo, 0, 0, 0);
+   } else if (is_a22x(ctx->screen)) {
+      /*
+       * A22X period-8 render-cycle fix: explicitly write per-tile bin ID.
+       * Encoding from webOS libGLESv2.so decomp: (col+1) | (row<<3).
+       * For 2x3 layout: 0x01, 0x02, 0x09, 0x0a, 0x11, 0x12 - all non-zero.
+       */
+      uint32_t col = tile->xoff / tile->bin_w;
+      uint32_t row = tile->yoff / tile->bin_h;
+      uint32_t bin_id = (col + 1) | (row << 3);
+
+      OUT_PKT3(ring, CP_SET_CONSTANT, 2);
+      OUT_RING(ring, CP_REG(REG_A2XX_VGT_CURRENT_BIN_ID_MIN));
+      OUT_RING(ring, bin_id);
+
+      OUT_PKT3(ring, CP_SET_CONSTANT, 2);
+      OUT_RING(ring, CP_REG(REG_A2XX_VGT_CURRENT_BIN_ID_MAX));
+      OUT_RING(ring, bin_id);
    }
 }
 
