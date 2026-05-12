@@ -57,7 +57,6 @@ use_hw_binning(struct fd_batch *batch)
 
    /* A20X uses shader-memexport-based binning; A22X uses the HW binner
     * engaged by LRZ_VSC_CONTROL=3 + the prelude in the A22X branch below.
-    * Both reuse the same per-pipe VSC_PIPE BO infrastructure.
     */
    if (!is_a20x(batch->ctx->screen) && !is_a22x(batch->ctx->screen))
       return false;
@@ -173,7 +172,8 @@ prepare_tile_fini_ib(struct fd_batch *batch) assert_dt
 
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
    OUT_RING(ring, CP_REG(REG_A2XX_PA_CL_CLIP_CNTL));
-   OUT_RING(ring, 0x00000000);
+   /* A22X: Set CLIP_DISABLE during GMEM operations per KGSL behavior */
+   OUT_RING(ring, is_a20x(ctx->screen) ? 0x00000000 : 0x00010000);
 
    OUT_PKT3(ring, CP_SET_CONSTANT, 5);
    OUT_RING(ring, CP_REG(REG_A2XX_PA_CL_VPORT_XSCALE));
@@ -181,6 +181,22 @@ prepare_tile_fini_ib(struct fd_batch *batch) assert_dt
    OUT_RING(ring, fui((float)gmem->bin_w / 2.0f)); /* XOFFSET */
    OUT_RING(ring, fui((float)gmem->bin_h / 2.0f)); /* YSCALE */
    OUT_RING(ring, fui((float)gmem->bin_h / 2.0f)); /* YOFFSET */
+
+   /* A22X: Disable LRZ/VSC during GMEM copy operations per KGSL behavior.
+    * This ensures the Low Resolution Z and Visibility Stream Cache don't
+    * interfere with the GMEM blit operations.
+    */
+   if (!is_a20x(ctx->screen)) {
+      OUT_PKT3(ring, CP_SET_CONSTANT, 2);
+      OUT_RING(ring, CP_REG(REG_A2XX_A220_RB_LRZ_VSC_CONTROL));
+      OUT_RING(ring, 0);
+   }
+
+   /* A22X: WFI before changing RB_MODECONTROL to ensure pipeline is idle.
+    * Mode transitions between COLOR_DEPTH and EDRAM_COPY require sync.
+    */
+   if (!is_a20x(ctx->screen))
+      OUT_WFI(ring);
 
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
    OUT_RING(ring, CP_REG(REG_A2XX_RB_MODECONTROL));
@@ -192,14 +208,20 @@ prepare_tile_fini_ib(struct fd_batch *batch) assert_dt
    if (batch->resolve & FD_BUFFER_COLOR)
       emit_gmem2mem_surf(batch, gmem->cbuf_base[0], &pfb->cbufs[0]);
 
+   /* A22X: WFI before switching back to COLOR_DEPTH mode */
+   if (!is_a20x(ctx->screen))
+      OUT_WFI(ring);
+
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
    OUT_RING(ring, CP_REG(REG_A2XX_RB_MODECONTROL));
    OUT_RING(ring, A2XX_RB_MODECONTROL_EDRAM_MODE(COLOR_DEPTH));
 
    if (!is_a20x(ctx->screen)) {
+      /* Restore VGT_VERTEX_REUSE_BLOCK_CNTL: was 0 (disabled debug
+       * leftover); restore to KGSL kernel default 0x02. */
       OUT_PKT3(ring, CP_SET_CONSTANT, 2);
       OUT_RING(ring, CP_REG(REG_A2XX_VGT_VERTEX_REUSE_BLOCK_CNTL));
-      OUT_RING(ring, 0x0000003b);
+      OUT_RING(ring, 0x00000002);
    }
 }
 
@@ -207,6 +229,18 @@ static void
 fd2_emit_tile_gmem2mem(struct fd_batch *batch, const struct fd_tile *tile)
 {
    fd2_emit_ib(batch->gmem, batch->tile_store);
+
+   /*
+    * The tile_store IB (built by prepare_tile_fini_ib) clobbers the same
+    * categories of state as fd2_emit_tile_mem2gmem - shader program (uses
+    * solid_prog), vertex buffer (solid_vertexbuf), RB_DEPTHCONTROL,
+    * PA_SU_SC_MODE_CNTL, PA_SC_AA_MASK, PA_CL_VPORT, PA_CL_CLIP_CNTL,
+    * RB_MODECONTROL, VGT_VERTEX_REUSE_BLOCK_CNTL.
+    *
+    * Mark all 3D state dirty so the next user draw re-emits everything.
+    * Same rationale as the dirty mark in fd2_emit_tile_mem2gmem.
+    */
+   fd_context_all_dirty(batch->ctx);
 }
 
 /* transfer from system memory to gmem */
@@ -297,10 +331,26 @@ fd2_emit_tile_mem2gmem(struct fd_batch *batch,
    OUT_RING(ring, CP_REG(REG_A2XX_VGT_INDX_OFFSET));
    OUT_RING(ring, 0);
 
+   /* A22X: Disable LRZ/VSC during mem2gmem blit per KGSL behavior.
+    * This ensures the Low Resolution Z and Visibility Stream Cache don't
+    * interfere with the texture restore blit operations.
+    */
+   if (!is_a20x(ctx->screen)) {
+      OUT_PKT3(ring, CP_SET_CONSTANT, 2);
+      OUT_RING(ring, CP_REG(REG_A2XX_A220_RB_LRZ_VSC_CONTROL));
+      OUT_RING(ring, 0);
+   }
+
    fd2_program_emit(ctx, ring, &ctx->blit_prog[0]);
 
    OUT_PKT0(ring, REG_A2XX_TC_CNTL_STATUS, 1);
    OUT_RING(ring, A2XX_TC_CNTL_STATUS_L2_INVALIDATE);
+
+   /* A22X: Wait for L2 cache invalidation to complete before texture fetch.
+    * Without this, stale texture data may be read during mem2gmem blit.
+    */
+   if (!is_a20x(batch->ctx->screen))
+      OUT_WFI(ring);
 
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
    OUT_RING(ring, CP_REG(REG_A2XX_RB_DEPTHCONTROL));
@@ -357,13 +407,22 @@ fd2_emit_tile_mem2gmem(struct fd_batch *batch,
 
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
    OUT_RING(ring, CP_REG(REG_A2XX_PA_CL_CLIP_CNTL));
-   OUT_RING(ring, 0x00000000);
+   /* A22X: Set CLIP_DISABLE during GMEM operations per KGSL behavior */
+   OUT_RING(ring, is_a20x(batch->ctx->screen) ? 0x00000000 : 0x00010000);
 
    if (fd_gmem_needs_restore(batch, tile, FD_BUFFER_DEPTH | FD_BUFFER_STENCIL))
       emit_mem2gmem_surf(batch, gmem->zsbuf_base[0], &pfb->zsbuf);
 
    if (fd_gmem_needs_restore(batch, tile, FD_BUFFER_COLOR))
       emit_mem2gmem_surf(batch, gmem->cbuf_base[0], &pfb->cbufs[0]);
+
+   /* A22X: Cache flush after mem2gmem draws as per blob driver behavior.
+    * This ensures texture data written to GMEM is coherent before rendering.
+    */
+   if (!is_a20x(ctx->screen)) {
+      OUT_PKT3(ring, CP_EVENT_WRITE, 1);
+      OUT_RING(ring, CACHE_FLUSH_AND_INV_EVENT);
+   }
 
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
    OUT_RING(ring, CP_REG(REG_A2XX_PA_CL_VTE_CNTL));
@@ -375,7 +434,51 @@ fd2_emit_tile_mem2gmem(struct fd_batch *batch,
                      A2XX_PA_CL_VTE_CNTL_VPORT_Z_SCALE_ENA |
                      A2XX_PA_CL_VTE_CNTL_VPORT_Z_OFFSET_ENA);
 
-   /* TODO blob driver seems to toss in a CACHE_FLUSH after each DRAW_INDX.. */
+   /*
+    * The mem2gmem tile setup above forcibly overwrote a stack of RB / PA
+    * registers AND the texture-sampler / shader-program / vertex-buffer
+    * state behind the back of fd2_emit_state's dirty-flag tracking:
+    *
+    *   blend / zsa:    RB_BLEND_CONTROL, RB_COLORCONTROL, RB_DEPTHCONTROL
+    *   rasterizer:     PA_SU_SC_MODE_CNTL, PA_CL_VTE_CNTL, PA_CL_CLIP_CNTL
+    *   sample_mask:    PA_SC_AA_MASK
+    *   scissor:        PA_SC_WINDOW_SCISSOR_*
+    *   viewport:       PA_CL_VPORT_*
+    *   framebuffer:    RB_COLOR_INFO, RB_SURFACE_INFO, RB_COLOR_MASK
+    *   tex/sampler:    SQ_TEX_0..5 (left at SQ_TEX_FILTER_POINT for blit!)
+    *   program:        fd2_program_emit installs the blit shader pair
+    *   vtxbuf:         fd2_emit_vertex_bufs binds solid_vertexbuf
+    *
+    * fd2_emit_state only re-emits these on the matching dirty bit. Since
+    * the pipe-level state objects haven't changed, those bits stay clean
+    * and subsequent user draws in the next batch inherit the GMEM tile
+    * setup's values - notably blend disabled with src=ONE/dst=ZERO, and
+    * the blit's POINT-filter texture sampler with the FB-as-texture
+    * binding.
+    *
+    * Symptoms on Adreno 220 / luna-surfacemanager + kmscube:
+    *   - LSM translucent UI bars render with broken alpha (yellow/orange/red
+    *     gradients in place of expected source-over compositing)
+    *   - LSM glyph rendering: text appears in the right position but
+    *     pixels are garbled - bilinear/linear sampler in user shader
+    *     left at POINT filter from the GMEM blit
+    *   - kmscube cube faces selectively go black, gradually filling in
+    *     across frames as different draws happen to dirty other state
+    *   - Touch animation transitions show transient corruption that
+    *     "snaps back" once unrelated state changes
+    *
+    * Fix: mark all overwritten state classes dirty so the next emit_state
+    * restores them.
+    */
+   /*
+    * Maximally aggressive: mark all 3D state dirty so the next user draw
+    * re-emits every register class. This is a diagnostic build to confirm
+    * whether the dirty-flag mechanism is the right lever at all - if this
+    * doesn't fix the post-LSM kmscube "white triangle in cube model
+    * space" symptom, the bug is somewhere else (state-emit not honoring
+    * dirty bits, threaded-context queue ordering, etc).
+    */
+   fd_context_all_dirty(ctx);
 }
 
 static void
@@ -461,6 +564,18 @@ fd2_emit_sysmem_prep(struct fd_batch *batch)
    patch_draws(batch, IGNORE_VISIBILITY);
    util_dynarray_clear(&batch->draw_patches);
    util_dynarray_clear(&batch->shader_patches);
+
+   /*
+    * fd2_emit_restore (above) writes a stack of GPU state for the bypass
+    * renderer setup that fd2_emit_state's dirty-flag tracking doesn't
+    * monitor (RB_BC_CONTROL on a20x, VGT_VERTEX_REUSE_BLOCK_CNTL,
+    * RBBM_PM_OVERRIDE1/2, TP0_CHICKEN, SQ_VS_CONST/PS_CONST,
+    * VGT_*_VTX_INDX, SQ_CONTEXT_MISC, plus a CP_INVALIDATE_STATE that
+    * resets a lot more). User draws after this need to re-emit their own
+    * state to recover from the bypass-path setup. Same rationale as
+    * fd2_emit_tile_mem2gmem / fd2_emit_tile_gmem2mem.
+    */
+   fd_context_all_dirty(ctx);
 }
 
 /* before first tile */
@@ -567,8 +682,12 @@ fd2_emit_tile_init(struct fd_batch *batch) assert_dt
 
    /* set to zero, for some reason hardware doesn't like certain values
     *
-    * A22X: skip the zero-write. Per-tile non-zero BIN_ID writes happen
-    * in fd2_emit_tile_renderprep below; let those be the only writes.
+    * A22X: skip the zero-write. The 0-value-is-bad warning in the
+    * original comment is real - the A22X hardware binner enters a
+    * cycling-state-machine mode when BIN_ID=0, producing the period-8
+    * tile-coverage cycle. Per-tile non-zero BIN_ID writes happen in
+    * fd2_emit_tile_renderprep below; let those be the only writes so
+    * the binner never sees BIN_ID=0.
     */
    if (!is_a22x(ctx->screen)) {
       OUT_PKT3(ring, CP_SET_CONSTANT, 2);
@@ -608,7 +727,44 @@ fd2_emit_tile_init(struct fd_batch *batch) assert_dt
     *
     * Reference: reports/a22x-hw-binning-port-analysis.md (sections 1-4).
     */
+   /* A22X Fork A/B baseline (2026-05-12, post-bisect):
+    *   Default behaviour for A22X is "Test 4" — proven stable across
+    *   30+ caps with no hangs:
+    *     use_hw_binning  TRUE (per-tile DRAW_INIT_FLAGS for A20X path)
+    *     prelude         RUN  (engage HW binner before binning IB)
+    *     binning IB      RUN  (VS-only binning shader populates VSC pipe BOs)
+    *     disengage       RUN  (LRZ_VSC_CONTROL=0 after binning IB)
+    *     visibility flt  SKIP for A22X (A20X keeps its working filter)
+    *
+    *   The visibility filter (patch_draws(USE_VISIBILITY) + per-tile
+    *   CP_SET_DRAW_INIT_FLAGS) hard-hangs A22X regardless of whether
+    *   the binning IB populated the BOs. webOS likely uses a different
+    *   A22X-specific visibility-consume packet — TBD.
+    *
+    * Bisect env-var toggles (diagnostic only):
+    *   FD2_SKIP_PRELUDE       skip Fork D prelude (LRZ_VSC_CONTROL=3, etc)
+    *   FD2_SKIP_DISENGAGE     skip LRZ_VSC_CONTROL=0 after binning IB
+    *   FD2_SKIP_BINNING_IB    skip fd2_emit_ib(batch->binning)
+    *   FD2_FORCE_VISIBILITY   re-enable patch_draws(USE_VIS) + per-tile
+    *                          CP_SET_DRAW_INIT_FLAGS for A22X (WILL HANG)
+    *   FD2_VSC_DUMP           dump VSC pipe BO contents per batch (diag)
+    */
+   /* Always allocate VSC pipe BOs for A22X if use_hw_binning is active —
+    * per-tile renderprep emits CP_SET_DRAW_INIT_FLAGS referencing
+    * ctx->vsc_pipe_bo[tile->p], so the BOs must exist regardless of
+    * whether the prelude runs.
+    */
    if (is_a22x(ctx->screen) && use_hw_binning(batch)) {
+      for (int i = 0; i < 8; i++) {
+         if (!ctx->vsc_pipe_bo[i]) {
+            ctx->vsc_pipe_bo[i] = fd_bo_new(ctx->dev, 0x40000, 0,
+                                            "a22x_vsc_pipe[%u]", i);
+            assert(ctx->vsc_pipe_bo[i]);
+         }
+      }
+   }
+
+   if (is_a22x(ctx->screen) && !getenv("FD2_SKIP_PRELUDE")) {
       const unsigned num_pipes = 8;
 
       /* DIAGNOSTIC: dump VSC pipe BO contents from the PREVIOUS batch
@@ -763,7 +919,21 @@ fd2_emit_tile_init(struct fd_batch *batch) assert_dt
    }
 
    if (use_hw_binning(batch)) {
-      patch_draws(batch, USE_VISIBILITY);
+      /* A22X: default to IGNORE_VISIBILITY because the visibility filter
+       * (patch_draws(USE_VISIBILITY) + per-tile CP_SET_DRAW_INIT_FLAGS)
+       * hard-hangs the GPU on A22X — confirmed across multiple bisect
+       * tests including with the binning IB actually running.
+       *
+       * webOS likely uses a different A22X-specific visibility-consume
+       * packet. Until that's identified, ship the working "binning IB
+       * runs, no visibility filter" config (Test 4) as the default.
+       *
+       * Set FD2_FORCE_VISIBILITY=1 to revert to USE_VISIBILITY (will hang
+       * on A22X — diagnostic only). A20X keeps its working filter. */
+      patch_draws(batch,
+                  (is_a22x(ctx->screen) && !getenv("FD2_FORCE_VISIBILITY"))
+                     ? IGNORE_VISIBILITY
+                     : USE_VISIBILITY);
 
       if (is_a20x(ctx->screen)) {
          /* A20X hw binning: shader-memexport mechanism.
@@ -859,6 +1029,8 @@ fd2_emit_tile_init(struct fd_batch *batch) assert_dt
        * in a follow-up (modify ir2_nir.c to skip memexport for A22X).
        */
 
+      /* Disable vertex reuse during binning (legitimate - binning has
+       * its own vertex processing constraints). */
       OUT_PKT3(ring, CP_SET_CONSTANT, 2);
       OUT_RING(ring, CP_REG(REG_A2XX_VGT_VERTEX_REUSE_BLOCK_CNTL));
       OUT_RING(ring, 0);
@@ -867,17 +1039,25 @@ fd2_emit_tile_init(struct fd_batch *batch) assert_dt
       OUT_PKT0(ring, REG_AXXX_CP_SCRATCH_REG3, 1);
       OUT_RING(ring, 0x10004);
 
-      fd2_emit_ib(ring, batch->binning);
+      /* A22X: run the binning IB by default. The IB executes safely
+       * when visibility filter is disabled (the default config). Set
+       * FD2_SKIP_BINNING_IB to skip it (diagnostic). */
+      if (!is_a22x(ctx->screen) || !getenv("FD2_SKIP_BINNING_IB")) {
+         fd2_emit_ib(ring, batch->binning);
+      }
 
       /* DIAGNOSTIC: marker 5 = binning IB returned */
       OUT_PKT0(ring, REG_AXXX_CP_SCRATCH_REG4, 1);
       OUT_RING(ring, 0x10005);
 
+      /* Restore VGT_VERTEX_REUSE_BLOCK_CNTL after binning - was 0
+       * (debug leftover that was never reverted); restore to KGSL
+       * kernel default 0x02. */
       OUT_PKT3(ring, CP_SET_CONSTANT, 2);
       OUT_RING(ring, CP_REG(REG_A2XX_VGT_VERTEX_REUSE_BLOCK_CNTL));
       OUT_RING(ring, 0x00000002);
 
-      if (is_a22x(ctx->screen)) {
+      if (is_a22x(ctx->screen) && !getenv("FD2_SKIP_DISENGAGE")) {
          /* Disengage the A22X HW binner after the binning IB has run.
           * Subsequent per-tile rendering uses the visibility data the
           * binner wrote to VSC_PIPE BOs, but the binner itself should
@@ -984,13 +1164,46 @@ fd2_emit_tile_renderprep(struct fd_batch *batch,
       OUT_RING(ring, tile->n);
 
       /* TODO only emit this when tile->p changes */
-      OUT_PKT3(ring, CP_SET_DRAW_INIT_FLAGS, 1);
-      OUT_RELOC(ring, pipe_bo, 0, 0, 0);
+      /* A22X: default skip the per-tile CP_SET_DRAW_INIT_FLAGS that
+       * points the rasterizer at the VSC pipe BO — hangs the GPU on
+       * A22X. A20X keeps its working filter. See patch_draws() above. */
+      if (!is_a22x(ctx->screen) || getenv("FD2_FORCE_VISIBILITY")) {
+         OUT_PKT3(ring, CP_SET_DRAW_INIT_FLAGS, 1);
+         OUT_RELOC(ring, pipe_bo, 0, 0, 0);
+      }
    } else if (is_a22x(ctx->screen)) {
       /*
        * A22X period-8 render-cycle fix: explicitly write per-tile bin ID.
-       * Encoding from webOS libGLESv2.so decomp: (col+1) | (row<<3).
-       * For 2x3 layout: 0x01, 0x02, 0x09, 0x0a, 0x11, 0x12 - all non-zero.
+       *
+       * Without hardware binning enabled (use_hw_binning() returns false
+       * for A22X - "TODO" in this file), Mesa previously left
+       * VGT_CURRENT_BIN_ID_MIN = MAX = 0 throughout the tile loop (set
+       * once in fd2_emit_tile_init with the comment "for some reason
+       * hardware doesn't like certain values"). The A22X hardware binner
+       * is nevertheless active under the hood; with bin_id pinned at 0
+       * it uses some internal-counter state to decide tile coverage,
+       * producing a deterministic 8-pattern visibility cycle observed
+       * across many investigations (see reports/ pattern of 8 distinct
+       * pixel-hash outputs where 1/8 is bit-exact correct and 7/8 are
+       * partial tile coverage).
+       *
+       * Encoding (revised 2026-05-11 from webOS libGLESv2.so decomp):
+       *   bin_id = (col + 1) | (row << 3)
+       *
+       * Initial v1 attempted the A20X reference encoding
+       * (((row+1) << 3) | (col+1) from freedreno_gmem.c:392) which
+       * produced no effect. Deeper analysis of the webOS proprietary
+       * decomp showed the pattern:
+       *   uVar24 = uVar27 + 1 | iVar5 * 8 | uVar24;
+       * which decodes as (col+1) | (row<<3) - col gets the +1
+       * offset, row does not. This produces bin_id=0x01 for the
+       * first tile rather than 0x09.
+       *
+       * For the standard 1024x768 / 2x3 tile layout this produces
+       * bin_ids 0x01, 0x02, 0x09, 0x0a, 0x11, 0x12 - all non-zero,
+       * all distinct. The (col+1) ensures the col-zero case lands
+       * on 1 instead of 0 (the "reserved" value the binner cycles
+       * around).
        */
       uint32_t col = tile->xoff / tile->bin_w;
       uint32_t row = tile->yoff / tile->bin_h;
