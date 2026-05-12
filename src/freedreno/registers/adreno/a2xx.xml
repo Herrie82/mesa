@@ -1087,7 +1087,13 @@ xsi:schemaLocation="https://gitlab.freedesktop.org/freedreno/ rules-fd.xsd">
 	<reg32 offset="0x0398" name="RBBM_PERFCOUNTER0_HI"/>
 	<reg32 offset="0x0399" name="RBBM_PERFCOUNTER1_LO"/>
 	<reg32 offset="0x039a" name="RBBM_PERFCOUNTER1_HI"/>
-	<reg32 offset="0x039b" name="RBBM_DEBUG"/>
+	<reg32 offset="0x039b" name="RBBM_DEBUG">
+		<!-- bit 24 is polled by the A220+ HW binner viz-consume sequence
+		     (CP_WAIT_REG_EQ in leia_perform_resolve): set when the binner has
+		     finished writing visibility data for the current pipe.  Verified
+		     against webOS libGLESv2 decomp 2026-05-12. -->
+		<bitfield name="A220_BINNER_DONE" pos="24" type="boolean"/>
+	</reg32>
 	<reg32 offset="0x039c" name="RBBM_PM_OVERRIDE1">
 		<bitfield name="RBBM_AHBCLK_PM_OVERRIDE" pos="0" type="boolean"/>
 		<bitfield name="SC_REG_SCLK_PM_OVERRIDE" pos="1" type="boolean"/>
@@ -1209,10 +1215,23 @@ xsi:schemaLocation="https://gitlab.freedesktop.org/freedreno/ rules-fd.xsd">
 	<reg32 offset="0x0a44" name="MH_INTERRUPT_CLEAR"/>
 	<reg32 offset="0x0a54" name="MH_CLNT_INTF_CTRL_CONFIG1"/>
 	<reg32 offset="0x0a55" name="MH_CLNT_INTF_CTRL_CONFIG2"/>
+	<!-- A220 HW visibility-stream compressor (VSC) block @ 0x0c00.
+	     leia_configure_binning_pass (webOS libGLESv2 decomp) writes 1 here
+	     to engage the binner at the start of the binning pass. -->
+	<reg32 offset="0x0c00" name="A220_VSC_PIPE_PARTITIONING">
+		<bitfield name="ENABLE" pos="0" type="boolean"/>
+	</reg32>
 	<reg32 offset="0x0c01" name="A220_VSC_BIN_SIZE">
 		<bitfield name="WIDTH" low="0" high="4" shr="5" type="uint"/>
 		<bitfield name="HEIGHT" low="5" high="9" shr="5" type="uint"/>
 	</reg32>
+	<!-- Per-pipe visibility-stream length output base.  The binner writes one
+	     u32 per pipe (stride 4) to *(VSC_SIZE_ADDRESS + pipe*4); the per-tile
+	     CP_SET_BIN_DATA packet then loads that length so the visibility
+	     filter sees how many bytes of the pipe data BO are valid.
+	     Address documented from webOS leia_perform_resolve decomp; the exact
+	     register offset within 0x0c02..0x0c05 has not yet been narrowed. -->
+	<reg32 offset="0x0c02" name="A220_VSC_SIZE_ADDRESS"/>
 	<array offset="0x0c06" name="VSC_PIPE" stride="3" length="8">
 		<reg32 offset="0x0" name="CONFIG"/>
 		<reg32 offset="0x1" name="DATA_ADDRESS"/>
@@ -1499,7 +1518,16 @@ xsi:schemaLocation="https://gitlab.freedesktop.org/freedreno/ rules-fd.xsd">
 	<reg32 offset="0x2208" name="RB_MODECONTROL">
 		<bitfield name="EDRAM_MODE" low="0" high="2" type="a2xx_rb_edram_mode"/>
 	</reg32>
-	<reg32 offset="0x2209" name="A220_RB_LRZ_VSC_CONTROL"/>
+	<!-- A220 binner / LRZ control.  Empirical values observed in webOS:
+	     0x03 = engage HW binner (bits 0+1 set during binning pass setup)
+	     0x84 = LRZ clear mode (bits 2+7) during resolve-time clear
+	     0x00 = disengage / passthrough after binning IB completes -->
+	<reg32 offset="0x2209" name="A220_RB_LRZ_VSC_CONTROL">
+		<bitfield name="BINNER_ENABLE0" pos="0" type="boolean"/>
+		<bitfield name="BINNER_ENABLE1" pos="1" type="boolean"/>
+		<bitfield name="LRZ_CLEAR_LO"   pos="2" type="boolean"/>
+		<bitfield name="LRZ_CLEAR_HI"   pos="7" type="boolean"/>
+	</reg32>
 	<reg32 offset="0x220a" name="RB_SAMPLE_POS"/>
 	<reg32 offset="0x220b" name="CLEAR_COLOR">
 		<bitfield name="RED" low="0" high="7"/>

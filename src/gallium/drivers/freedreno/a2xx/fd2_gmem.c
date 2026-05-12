@@ -583,6 +583,7 @@ static void
 fd2_emit_tile_init(struct fd_batch *batch) assert_dt
 {
    struct fd_context *ctx = batch->ctx;
+   struct fd2_context *fd2_ctx = fd2_context(ctx);
    struct fd_ringbuffer *ring = batch->gmem;
    struct pipe_framebuffer_state *pfb = &batch->framebuffer;
    const struct fd_gmem_stateobj *gmem = batch->gmem_state;
@@ -747,13 +748,52 @@ fd2_emit_tile_init(struct fd_batch *batch) assert_dt
     *   FD2_SKIP_BINNING_IB    skip fd2_emit_ib(batch->binning)
     *   FD2_FORCE_VISIBILITY   re-enable patch_draws(USE_VIS) + per-tile
     *                          CP_SET_DRAW_INIT_FLAGS for A22X (WILL HANG)
+    *   FD2_USE_BIN_DATA       enable webOS-style per-tile CP_SET_BIN_DATA
+    *                          consume (implies FULL_DISENGAGE + 0xC04=0).
+    *                          Patches draws to USE_VISIBILITY so the
+    *                          filter reads the bound stream.
+    *                          v5 default emits SET_BIN_DATA only, no WAIT.
+    *   FD2_BIN_DATA_NO_VIS    v6 diagnostic: emits SET_BIN_DATA per
+    *                          tile and the full-disengage / 0xC04=0
+    *                          prelude, but keeps patch_draws as
+    *                          IGNORE_VISIBILITY.  Lets us tell whether
+    *                          the hang is in SET_BIN_DATA itself or in
+    *                          the visibility-filter draws.
+    *   FD2_BIN_WAIT           also emit the per-tile CP_WAIT_REG_EQ on
+    *                          RBBM_DEBUG.A220_BINNER_DONE before each
+    *                          SET_BIN_DATA (v3 behaviour).  Diagnostic
+    *                          only — hangs the GPU because bit 24
+    *                          never latches on Mesa's path.
+    *   FD2_BIN_FULL_DISENGAGE add 0xC00=0 + CACHE_FLUSH event +
+    *                          CP_WAIT_REG_EQ RBBM_STATUS to the
+    *                          disengage block (v3 — required for the
+    *                          binner to actually flush its FIFOs;
+    *                          collapses the period-16 cycle on its own)
     *   FD2_VSC_DUMP           dump VSC pipe BO contents per batch (diag)
+    *   FD2_PIN_BIN_ID=<n>     v8 diagnostic: override per-tile
+    *                          VGT_CURRENT_BIN_ID with a fixed value <n>
+    *                          for all tiles.  Tests whether the SQ
+    *                          wavefront slot is keyed off bin_id (and
+    *                          therefore whether per-tile slot rotation
+    *                          is the source of the period-N cycle).
     */
-   /* Always allocate VSC pipe BOs for A22X if use_hw_binning is active —
-    * per-tile renderprep emits CP_SET_DRAW_INIT_FLAGS referencing
-    * ctx->vsc_pipe_bo[tile->p], so the BOs must exist regardless of
-    * whether the prelude runs.
+   /* Allocate VSC pipe BOs + the per-context VSC_SIZE BO for A22X
+    * when use_hw_binning is active.  Per-tile renderprep emits
+    * CP_SET_BIN_DATA referencing both when FD2_USE_BIN_DATA /
+    * FD2_BIN_DATA_NO_VIS is set, so they must exist by then.
+    *
+    * v7: also gate the vsc_size_mem allocation behind the same env
+    * vars.  v6 default unconditionally allocated it and wrote
+    * VSC_SIZE_ADDRESS in the prelude; that perturbed the binner state
+    * enough to drift the hash pool and (after a 15 s idle) wedge the
+    * device during runtime-PM suspend.  v7 default never allocates
+    * size_mem and never touches VSC_SIZE_ADDRESS — byte-identical to
+    * pre-0098 Test 4 baseline.
     */
+   bool use_bin_data = is_a22x(ctx->screen) &&
+                       (getenv("FD2_USE_BIN_DATA") ||
+                        getenv("FD2_BIN_DATA_NO_VIS") ||
+                        getenv("FD2_BIN_FULL_DISENGAGE"));
    if (is_a22x(ctx->screen) && use_hw_binning(batch)) {
       for (int i = 0; i < 8; i++) {
          if (!ctx->vsc_pipe_bo[i]) {
@@ -761,6 +801,14 @@ fd2_emit_tile_init(struct fd_batch *batch) assert_dt
                                             "a22x_vsc_pipe[%u]", i);
             assert(ctx->vsc_pipe_bo[i]);
          }
+      }
+      if (use_bin_data && !fd2_ctx->vsc_size_mem) {
+         /* 32 bytes is enough (8 pipes × 4 bytes), but match the A3XX
+          * 0x1000 page allocation so the BO lands on its own page and
+          * can never share a cache line with unrelated state. */
+         fd2_ctx->vsc_size_mem =
+            fd_bo_new(ctx->dev, 0x1000, 0, "a22x_vsc_size");
+         assert(fd2_ctx->vsc_size_mem);
       }
    }
 
@@ -830,6 +878,53 @@ fd2_emit_tile_init(struct fd_batch *batch) assert_dt
       OUT_RING(ring, A2XX_A220_VSC_BIN_SIZE_WIDTH(gmem->bin_w) |
                      A2XX_A220_VSC_BIN_SIZE_HEIGHT(gmem->bin_h));
 
+      /* VSC_SIZE_ADDRESS: tell the binner where to write the per-pipe
+       * visibility-stream length (one u32 per pipe).  Mirrors A3XX
+       * update_vsc_pipe(), but using OUT_PKT0 because A2XX VSC regs
+       * are below 0x2000 (CP_SET_CONSTANT range).  The per-tile
+       * CP_SET_BIN_DATA packet later loads from this BO at offset
+       * tile->p * 4 to feed the visibility filter.
+       *
+       * v5 ordering: webOS leia_configure_binid_groups (decomp line 3358)
+       * writes the VSC configs in this exact order, per renderpass:
+       *   0xC01 (VSC_BIN_SIZE) -> 0xC02 (VSC_SIZE_ADDRESS) ->
+       *   0xC04 = 0 (undocumented A22X-only binner control) ->
+       *   0xC06+ (VSC_PIPE array, 24 dwords for 8 pipes).
+       * The 0xC04 = 0 write is critical: KGSL inits the full 0xC01..0xC1D
+       * range at context start, but mainline drm/msm a2xx doesn't, so
+       * 0xC04 holds stale state and CP_SET_BIN_DATA later trips on it.
+       */
+      /* v7: gate the VSC_SIZE_ADDRESS write behind the same env-vars
+       * that gate the rest of the binner-consume work.  Default path
+       * never writes this register — pre-0098 baseline restored.
+       */
+      if (use_bin_data) {
+         OUT_PKT0(ring, REG_A2XX_A220_VSC_SIZE_ADDRESS, 1);
+         OUT_RELOC(ring, fd2_ctx->vsc_size_mem, 0, 0, 0);
+      }
+
+      /* v5: undocumented A22X-only binner control register @ 0xC04.
+       * webOS writes 0 here once per renderpass.  Without this, the
+       * binner / visibility filter operates on stale state and
+       * CP_SET_BIN_DATA hangs the GPU (confirmed v4 on-device test
+       * 2026-05-12: 0098 v4 with FD2_USE_BIN_DATA=1 caused hw_init
+       * reset loop and USB drop).  No symbolic name in any reference
+       * we've seen; KGSL's adreno_a2xx.c snapshot range includes it
+       * (REG_A220_VSC_BIN_SIZE..REG_A220_VSC_PIPE_DATA_LENGTH_7) so
+       * it is a real register, just undocumented.
+       *
+       * v6: gated behind FD2_USE_BIN_DATA / FD2_BIN_FULL_DISENGAGE.
+       * v5 emitted this unconditionally, which broke FD2_VSC_DUMP
+       * double-render mode (confirmed v5 on-device 2026-05-12: device
+       * full lockup, rapid-fire hangchecks, recover_worker stuck).
+       * Default path (no env vars) must remain a no-op vs pre-0098
+       * behaviour.
+       */
+      if (use_bin_data) {
+         OUT_PKT0(ring, 0x0c04, 1);
+         OUT_RING(ring, 0x00000000);
+      }
+
       /* VSC_PIPE[0..7]: 24 consecutive regs at 0xC06 (CONFIG, ADDRESS, LENGTH)
        * CONFIG encoding from webOS decomp: (h<<24)|(w<<20)|(y<<10)|x.
        * Bit layout independently verified against documented A3XX
@@ -867,12 +962,13 @@ fd2_emit_tile_init(struct fd_batch *batch) assert_dt
       OUT_RING(ring, 0x00000000);
       OUT_WFI(ring);
 
-      /* A220_VSC_ENABLE @ 0xC00 = 1 -- undocumented master enable.
-       * webOS writes this via a type-0 PM4 packet. The register is not
-       * in a2xx.xml so we use the raw address.
+      /* A220_VSC_PIPE_PARTITIONING.ENABLE = 1 -- master engage for the
+       * HW binner.  webOS writes this via a type-0 PM4 packet at the
+       * start of leia_configure_binning_pass; without it the binner does
+       * not advance past stream-out setup.
        */
-      OUT_PKT0(ring, 0xC00, 1);
-      OUT_RING(ring, 1);
+      OUT_PKT0(ring, REG_A2XX_A220_VSC_PIPE_PARTITIONING, 1);
+      OUT_RING(ring, A2XX_A220_VSC_PIPE_PARTITIONING_ENABLE);
 
       /* Engage the binner: A220_RB_LRZ_VSC_CONTROL = 3 (webOS value).
        * WFI follows immediately after, per webOS ordering — earlier v2
@@ -919,21 +1015,37 @@ fd2_emit_tile_init(struct fd_batch *batch) assert_dt
    }
 
    if (use_hw_binning(batch)) {
-      /* A22X: default to IGNORE_VISIBILITY because the visibility filter
-       * (patch_draws(USE_VISIBILITY) + per-tile CP_SET_DRAW_INIT_FLAGS)
-       * hard-hangs the GPU on A22X — confirmed across multiple bisect
-       * tests including with the binning IB actually running.
+      /* A22X default = IGNORE_VISIBILITY (Test 4 shipping baseline).
+       * Env-vars that switch the A22X consume path:
        *
-       * webOS likely uses a different A22X-specific visibility-consume
-       * packet. Until that's identified, ship the working "binning IB
-       * runs, no visibility filter" config (Test 4) as the default.
+       *   FD2_USE_BIN_DATA       webOS-style CP_SET_BIN_DATA per tile.
+       *                          Implies USE_VISIBILITY so the draws
+       *                          actually consume the stream the
+       *                          packet binds.
+       *   FD2_BIN_DATA_NO_VIS    same as above BUT keep patch_draws as
+       *                          IGNORE_VISIBILITY (v6 diagnostic):
+       *                          emits SET_BIN_DATA so the binner
+       *                          state machine "consumes" each pipe,
+       *                          but the draws don't actually filter
+       *                          on the visibility stream.  If
+       *                          USE_BIN_DATA hangs but NO_VIS does
+       *                          not, the bug is in the draw-side
+       *                          visibility filter consumption, not
+       *                          in SET_BIN_DATA itself.
+       *   FD2_FORCE_VISIBILITY   legacy A20X CP_SET_DRAW_INIT_FLAGS
+       *                          path.  Confirmed to hard-hang on A22X.
+       *                          Falsifier knob only.
        *
-       * Set FD2_FORCE_VISIBILITY=1 to revert to USE_VISIBILITY (will hang
-       * on A22X — diagnostic only). A20X keeps its working filter. */
+       * A20X always uses USE_VISIBILITY (its CP_SET_DRAW_INIT_FLAGS path
+       * is the original, working freedreno binning consume).
+       */
+      bool a22x = is_a22x(ctx->screen);
+      bool a22x_visibility = a22x && !getenv("FD2_BIN_DATA_NO_VIS") &&
+                             (getenv("FD2_USE_BIN_DATA") ||
+                              getenv("FD2_FORCE_VISIBILITY"));
       patch_draws(batch,
-                  (is_a22x(ctx->screen) && !getenv("FD2_FORCE_VISIBILITY"))
-                     ? IGNORE_VISIBILITY
-                     : USE_VISIBILITY);
+                  (!a22x || a22x_visibility) ? USE_VISIBILITY
+                                             : IGNORE_VISIBILITY);
 
       if (is_a20x(ctx->screen)) {
          /* A20X hw binning: shader-memexport mechanism.
@@ -1062,11 +1174,52 @@ fd2_emit_tile_init(struct fd_batch *batch) assert_dt
           * Subsequent per-tile rendering uses the visibility data the
           * binner wrote to VSC_PIPE BOs, but the binner itself should
           * not be re-engaged for render-pass draws.
+          *
+          * webOS-equivalent block (leia_perform_resolve decomp, 12 dwords
+          * gated on `binner_used`):
+          *   1. LRZ_VSC_CONTROL = 0                  (disengage binner)
+          *   2. A220_VSC_PIPE_PARTITIONING (0xC00)=0 (master disengage)
+          *   3. CP_EVENT_WRITE CACHE_FLUSH (event 6) (flush binner FIFOs;
+          *                                            sets RBBM_DEBUG.A220_BINNER_DONE)
+          *   4. CP_WAIT_REG_EQ RBBM_STATUS, mask=0x5f601000  (3D pipe idle)
+          *
+          * v2 of this patch only emitted (1) + WFI; per-tile
+          * CP_WAIT_REG_EQ then polled RBBM_DEBUG bit 24 forever because
+          * the CACHE_FLUSH event was missing.  v3 adds (2), (3), (4) to
+          * mirror webOS exactly.
+          *
+          * Default-disabled via FD2_BIN_FULL_DISENGAGE so the v2 path
+          * remains the fallback if v3 still doesn't unblock the bit.
           */
          OUT_PKT3(ring, CP_SET_CONSTANT, 2);
          OUT_RING(ring, CP_REG(REG_A2XX_A220_RB_LRZ_VSC_CONTROL));
          OUT_RING(ring, 0x00000000);
-         OUT_WFI(ring);
+
+         if (use_bin_data) {
+            /* (2) Master disengage of the A220 binner module. */
+            OUT_PKT0(ring, REG_A2XX_A220_VSC_PIPE_PARTITIONING, 1);
+            OUT_RING(ring, 0);
+
+            /* (3) CACHE_FLUSH event — flushes binner internal FIFOs and
+             *     latches RBBM_DEBUG.A220_BINNER_DONE (bit 24).
+             */
+            OUT_PKT3(ring, CP_EVENT_WRITE, 1);
+            OUT_RING(ring, CACHE_FLUSH);
+
+            /* (4) Explicit poll for full 3D pipeline idle.  webOS uses
+             *     this in place of WFI; the mask covers VGT/SX/TPC/SC/PA/
+             *     RB/SQ_CNTX0+17/VGT_NO_DMA — every stage that could
+             *     still be holding binner state.  WFI alone only waits
+             *     on the CP queue and is not sufficient here.
+             */
+            OUT_PKT3(ring, CP_WAIT_REG_EQ, 4);
+            OUT_RING(ring, REG_A2XX_RBBM_STATUS);
+            OUT_RING(ring, 0x00000000);
+            OUT_RING(ring, 0x5f601000);
+            OUT_RING(ring, 0x00000001);
+         } else {
+            OUT_WFI(ring);
+         }
 
          /* DIAGNOSTIC: marker 6 = disengage complete */
          OUT_PKT0(ring, REG_AXXX_CP_SCRATCH_REG5, 1);
@@ -1155,19 +1308,89 @@ fd2_emit_tile_renderprep(struct fd_batch *batch,
    if (use_hw_binning(batch)) {
       struct fd_bo *pipe_bo = ctx->vsc_pipe_bo[tile->p];
 
+      /* v8 diagnostic: pin VGT_CURRENT_BIN_ID to a single value across
+       * all tiles to test the SQ-wavefront-slot-via-bin_id hypothesis.
+       *
+       * Visual analysis of v6 T1 default captures shows the period-N
+       * cycle is per-tile vertex-attribute corruption — each tile picks
+       * a different SQ slot, only one has correct state.  tile->n
+       * cycles 0..N-1 for the N visible tiles and is the obvious
+       * candidate for "what selects the SQ slot".
+       *
+       * If FD2_PIN_BIN_ID=<n> is set, all tiles emit the same bin_id
+       * value.  All tiles would then land on the same SQ slot; if that
+       * slot holds the user's correct state, ALL tiles should render
+       * correctly and we'd see a clean 5adc3160 (or a single-hash
+       * collapse to a non-blank correct render).
+       *
+       * If pinning collapses the cycle and the result is a real
+       * triangle: SQ-slot-via-bin_id hypothesis CONFIRMED.
+       * If pinning collapses to blank/wrong: bin_id IS the slot
+       * selector but no slot holds the correct state.
+       * If pinning doesn't collapse: hypothesis FALSIFIED.
+       */
+      const char *pin = getenv("FD2_PIN_BIN_ID");
+      uint32_t bin_id = pin ? (uint32_t)atoi(pin) : tile->n;
+
       OUT_PKT3(ring, CP_SET_CONSTANT, 2);
       OUT_RING(ring, CP_REG(REG_A2XX_VGT_CURRENT_BIN_ID_MIN));
-      OUT_RING(ring, tile->n);
+      OUT_RING(ring, bin_id);
 
       OUT_PKT3(ring, CP_SET_CONSTANT, 2);
       OUT_RING(ring, CP_REG(REG_A2XX_VGT_CURRENT_BIN_ID_MAX));
-      OUT_RING(ring, tile->n);
+      OUT_RING(ring, bin_id);
 
-      /* TODO only emit this when tile->p changes */
-      /* A22X: default skip the per-tile CP_SET_DRAW_INIT_FLAGS that
-       * points the rasterizer at the VSC pipe BO — hangs the GPU on
-       * A22X. A20X keeps its working filter. See patch_draws() above. */
-      if (!is_a22x(ctx->screen) || getenv("FD2_FORCE_VISIBILITY")) {
+      if (is_a22x(ctx->screen)) {
+         /* A22X visibility-stream consume.  Matches webOS
+          * leia_perform_resolve per-tile sequence:
+          *
+          *   CP_WAIT_REG_EQ  reg=RBBM_DEBUG mask=0x01000000 val=0x01000000
+          *   CP_SET_BIN_DATA pipe_data_addr=VSC_PIPE[p].DATA_ADDRESS
+          *                   bin_size_addr =VSC_SIZE_ADDRESS + p*4
+          *
+          * The WAIT_REG_EQ stalls the CP until the binner reports its
+          * per-pipe stream is complete (RBBM_DEBUG.A220_BINNER_DONE).
+          * Then CP_SET_BIN_DATA tells the visibility filter where to
+          * find the stream + how many bytes are valid for this tile's
+          * pipe.  Mesa's CP_SET_DRAW_INIT_FLAGS path (used on A20X) is
+          * the wrong consume packet for A22X and hangs the GPU.
+          *
+          * Default-disabled: needs FD2_USE_BIN_DATA=1 (or v6's
+          * FD2_BIN_DATA_NO_VIS=1) in the environment so we can bisect
+          * against the Test 4 baseline (IGNORE_VISIBILITY, no per-tile
+          * consume) without rebuild.
+          */
+         if (getenv("FD2_USE_BIN_DATA") || getenv("FD2_BIN_DATA_NO_VIS")) {
+            /* v4: per-tile CP_WAIT_REG_EQ default-OFF.
+             *
+             * v3 test (2026-05-12, 10 caps): adding the WAIT here hangs
+             * the GPU 4 times per cap — hangcheck fires after 3s and
+             * recover_worker resets the pipeline.  The poll never sees
+             * bit 24 latch even with CACHE_FLUSH event in the disengage
+             * block.  The cycle DID collapse (16 hashes → 1 hash, all
+             * d1dd210d) so the binner is working, but the output is the
+             * post-recovery state, not a real render.
+             *
+             * Set FD2_BIN_WAIT=1 to re-enable the WAIT (diagnostic for
+             * finding the right poll target).
+             */
+            if (getenv("FD2_BIN_WAIT")) {
+               OUT_PKT3(ring, CP_WAIT_REG_EQ, 4);
+               OUT_RING(ring, REG_A2XX_RBBM_DEBUG);
+               OUT_RING(ring, 0x01000000);  /* A220_BINNER_DONE = 1 */
+               OUT_RING(ring, 0x01000000);  /* mask */
+               OUT_RING(ring, 0x00000001);  /* poll interval */
+            }
+
+            OUT_PKT3(ring, CP_SET_BIN_DATA, 2);
+            OUT_RELOC(ring, pipe_bo, 0, 0, 0);       /* BIN_DATA_ADDR */
+            OUT_RELOC(ring, fd2_ctx->vsc_size_mem,   /* BIN_SIZE_ADDR */
+                      tile->p * 4, 0, 0);
+         }
+      } else {
+         /* A20X path: CP_SET_DRAW_INIT_FLAGS points the rasterizer at
+          * the VSC pipe BO.  Confirmed working for A20X.
+          */
          OUT_PKT3(ring, CP_SET_DRAW_INIT_FLAGS, 1);
          OUT_RELOC(ring, pipe_bo, 0, 0, 0);
       }
