@@ -657,6 +657,33 @@ fd2_emit_tile_fini(struct fd_batch *batch) assert_dt
          OUT_RING(ring, 0x16);  /* CACHE_FLUSH_AND_INV_EVENT */
       }
    }
+
+   /* FD2_END_TC_INV=N: emit N inline TC_CNTL_STATUS = L2_INVALIDATE
+    * writes at end of tile loop (PM4 type-0 register write).
+    *
+    * Decompiled vendor libGLESv2 binaries (HTC/Samsung/Xiaomi/webOS)
+    * all have a leia_cmdbuffer_inserttexcacheinvalid helper that
+    * emits exactly this:
+    *
+    *   *param_1 = 0xe00;   (PM4 type-0 header, write 1 dword to
+    *                        REG_A2XX_TC_CNTL_STATUS word 0x0e00)
+    *   param_1[1] = 1;     (value = L2_INVALIDATE bit 0)
+    *
+    * We tested writing this register via debugfs (CPU-side direct
+    * MMIO write) and got no effect on 0x0ee2 cycle.  But that path
+    * may hit GPU while clock-gated and silently fail.  Inline-in-
+    * cmdstream emission means CP executes the write during active
+    * render - different timing, possibly different semantics.
+    */
+   const char *tcinv_env = getenv("FD2_END_TC_INV");
+   if (tcinv_env) {
+      int n = atoi(tcinv_env);
+      if (n <= 0) n = 1;
+      for (int i = 0; i < n; i++) {
+         OUT_PKT0(ring, REG_A2XX_TC_CNTL_STATUS, 1);
+         OUT_RING(ring, A2XX_TC_CNTL_STATUS_L2_INVALIDATE);
+      }
+   }
 }
 
 /* before first tile */
