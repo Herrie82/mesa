@@ -25,6 +25,9 @@ fd2_context_destroy(struct pipe_context *pctx) in_dt
    if (fd2_ctx->vsc_size_mem)
       fd_bo_del(fd2_ctx->vsc_size_mem);
 
+   if (fd2_ctx->vsc_regsave_mem)
+      fd_bo_del(fd2_ctx->vsc_regsave_mem);
+
    fd_context_destroy(pctx);
    free(pctx);
 }
