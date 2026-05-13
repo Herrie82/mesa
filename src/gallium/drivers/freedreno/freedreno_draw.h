@@ -103,6 +103,24 @@ fd_draw(struct fd_batch *batch, struct fd_ringbuffer *ring,
 
    emit_marker(ring, 7);
 
+   /* A22X per-draw DEALLOC bisect (FD2_PER_DRAW_DEALLOC=1).
+    *
+    * Round-4 falsified end-of-tile-loop DEALLOC events as
+    * cycle-fixers.  Gemini round-5 hypothesis: events need to be
+    * emitted RIGHT AFTER each CP_DRAW_INDX, not deferred to end of
+    * batch.  Tests whether slot deallocation is tied to draw
+    * proximity.
+    *
+    * Emits VS_DEALLOC (0x00) + PS_DEALLOC (0x01) after every draw.
+    * Gated on is_a22x screen.
+    */
+   if (is_a22x(batch->ctx->screen) && getenv("FD2_PER_DRAW_DEALLOC")) {
+      OUT_PKT3(ring, CP_EVENT_WRITE, 1);
+      OUT_RING(ring, 0x00);  /* VS_DEALLOC */
+      OUT_PKT3(ring, CP_EVENT_WRITE, 1);
+      OUT_RING(ring, 0x01);  /* PS_DEALLOC */
+   }
+
    fd_reset_wfi(batch);
 }
 
