@@ -1261,8 +1261,17 @@ fd2_emit_tile_init(struct fd_batch *batch) assert_dt
 
       /* A22X: run the binning IB by default. The IB executes safely
        * when visibility filter is disabled (the default config). Set
-       * FD2_SKIP_BINNING_IB to skip it (diagnostic). */
-      if (!is_a22x(ctx->screen) || !getenv("FD2_SKIP_BINNING_IB")) {
+       * FD2_SKIP_BINNING_IB to skip it (diagnostic).
+       *
+       * FD2_SPLIT_BINNING=1: do NOT emit the binning IB here inline.
+       * Instead, flush_ring() in freedreno_gmem.c issues batch->binning
+       * as its own separate MSM_SUBMIT BEFORE the main batch.  This
+       * matches webOS's submit-topology where binning is a distinct
+       * ioctl, triggering the GPU's 0x7f-namespace transition in
+       * register 0x0ee2 (see reports/webos-ib-decode-2026-05-13.md).
+       */
+      if ((!is_a22x(ctx->screen) || !getenv("FD2_SKIP_BINNING_IB")) &&
+          !getenv("FD2_SPLIT_BINNING")) {
          fd2_emit_ib(ring, batch->binning);
       }
 

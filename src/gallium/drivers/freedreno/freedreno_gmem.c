@@ -815,6 +815,71 @@ fd_a22x_multi_flush_align(struct fd_batch *batch)
    }
 }
 
+/* v8: split A22X binning IB into its own MSM_SUBMIT (FD2_SPLIT_BINNING=1).
+ *
+ * webOS observation (reports/webos-ib-decode-2026-05-13.md):
+ *   webOS emits 16 ISSUEIBCMDS per render.  The binning pass is its own
+ *   submit.  Mainline Mesa packs binning + tile renderprep + draws +
+ *   resolve all into a single megasubmit, which keeps the per-IB cycle
+ *   counter (reg 0x0ee2) deterministic in the 0x15-namespace only and
+ *   produces the period-16 cycle of corrupt frames.
+ *
+ * This emits batch->binning as a STANDALONE MSM_SUBMIT BEFORE the main
+ * batch flush.  Coordinates with fd2_gmem.c which (when FD2_SPLIT_BINNING
+ * is set) skips the inline fd2_emit_ib(batch->binning) call so the
+ * binning IB isn't run twice.
+ *
+ * Expected effect on 0x0ee2: visits 0x7f namespace during binner
+ * execution, then returns to 0x15 for raster.  Breaks the deterministic
+ * +1/cap pointer advance.
+ */
+static void
+fd_a22x_split_binning_flush(struct fd_batch *batch)
+{
+   struct fd_screen *screen = batch->ctx->screen;
+
+   if (FD_DBG(NOHW))
+      return;
+   if (!is_a22x(screen))
+      return;
+   if (!getenv("FD2_SPLIT_BINNING"))
+      return;
+   if (!batch->binning)
+      return;
+
+   struct fd_submit *bin_submit = fd_submit_new(batch->ctx->pipe);
+   if (!bin_submit)
+      return;
+   struct fd_ringbuffer *rb =
+      fd_submit_new_ringbuffer(bin_submit, 32, FD_RINGBUFFER_PRIMARY);
+   if (!rb) {
+      fd_submit_del(bin_submit);
+      return;
+   }
+
+   /* Emit CP_INDIRECT_BUFFER to batch->binning - same packet
+    * fd2_emit_ib emits (prefetch=false on A2XX), but in our
+    * standalone submit's primary ringbuffer.
+    * fd_ringbuffer_emit_reloc_ring_full inside __OUT_IB attaches
+    * the target's BO to the new submit's BO list. */
+   __OUT_IB(rb, false, batch->binning);
+
+   /* Sync barrier - ensure binner completes before main batch starts */
+   OUT_PKT3(rb, CP_WAIT_FOR_IDLE, 1);
+   OUT_RING(rb, 0x00000000);
+
+   struct fd_fence *bin_fence = fd_submit_flush(bin_submit, -1, false);
+   if (bin_fence) {
+      /* Wait for binning to retire so main batch sees its visibility
+       * stream output in VSC_PIPE BOs. */
+      fd_fence_wait(bin_fence);
+      fd_fence_del(bin_fence);
+   }
+
+   fd_ringbuffer_del(rb);
+   fd_submit_del(bin_submit);
+}
+
 static void
 flush_ring(struct fd_batch *batch)
 {
@@ -823,6 +888,10 @@ flush_ring(struct fd_batch *batch)
       use_fence_fd = batch->fence->use_fence_fd;
 
    struct fd_fence *fence;
+
+   /* v8: split binning IB into its own MSM_SUBMIT before main batch.
+    * Gated on FD2_SPLIT_BINNING env var.  See block comment above. */
+   fd_a22x_split_binning_flush(batch);
 
    if (FD_DBG(NOHW)) {
       /* construct a dummy fence: */
