@@ -578,6 +578,70 @@ fd2_emit_sysmem_prep(struct fd_batch *batch)
    fd_context_all_dirty(ctx);
 }
 
+/* end of tile loop - emit "release slot" events to deallocate the 16-entry
+ * VPC / TC / faceness pool that the GPU consumes one slot of per Mesa batch.
+ *
+ * Background (reports/gemini-summary-2026-05-13-cycle-register.md):
+ *   Register word 0x0ee2 advances deterministically per Mesa render with
+ *   period 16 - one slot per submit, wrap to slot 0 every 16th render.
+ *   1 in 16 caps produces the correct frame (slot 0 = boot state).
+ *   Mesa is leaking pool slots; vendor drivers don't (they emit different
+ *   events or use a "global" submit path).
+ *
+ * webOS strings survey: emits CP_EVENT_WRITE for 0x06 (CACHE_FLUSH),
+ *   0x17 (PERFCOUNTER_START), 0x18 (PERFCOUNTER_STOP), 0x1c
+ *   (FACENESS_FLUSH).  Mesa freedreno A2XX emits only 0x16
+ *   (CACHE_FLUSH_AND_INV_EVENT).
+ *
+ * Three env vars bisect which event(s) collapse the cycle:
+ *   FD2_END_CTX_DONE     emit CP_EVENT_WRITE 0x05 (CONTEXT_DONE)
+ *   FD2_END_FACENESS     emit CP_EVENT_WRITE 0x1c (FACENESS_FLUSH)
+ *   FD2_END_DEALLOC      emit 0x00 (VS_DEALLOC) + 0x01 (PS_DEALLOC)
+ *
+ * Default (no env vars) = byte-identical to prior behaviour (no events).
+ */
+static void
+fd2_emit_tile_fini(struct fd_batch *batch) assert_dt
+{
+   struct fd_context *ctx = batch->ctx;
+   struct fd_ringbuffer *ring = batch->gmem;
+
+   if (!is_a22x(ctx->screen))
+      return;
+
+   if (getenv("FD2_END_CTX_DONE")) {
+      OUT_PKT3(ring, CP_EVENT_WRITE, 1);
+      OUT_RING(ring, 0x05);  /* CONTEXT_DONE */
+   }
+
+   if (getenv("FD2_END_FACENESS")) {
+      OUT_PKT3(ring, CP_EVENT_WRITE, 1);
+      OUT_RING(ring, 0x1c);  /* FACENESS_FLUSH */
+   }
+
+   /* FD2_END_DEALLOC=N emits N pairs of VS_DEALLOC + PS_DEALLOC.
+    *
+    * Round-3 test showed N=1 (single pair) shifts the period-16 cycle
+    * by exactly 1 cap (5adc3160 moves cap 1 -> cap 2).  Gemini round-4
+    * hypothesis: each render consumes 2 slots (binning draw + render
+    * draw), so we need N=2 to pin the cycle.  Test by setting
+    * FD2_END_DEALLOC=2 (or higher to verify saturation).
+    * FD2_END_DEALLOC=1 keeps the prior single-pair behaviour for
+    * direct comparison.
+    */
+   const char *dealloc_env = getenv("FD2_END_DEALLOC");
+   if (dealloc_env) {
+      int n = atoi(dealloc_env);
+      if (n <= 0) n = 1;
+      for (int i = 0; i < n; i++) {
+         OUT_PKT3(ring, CP_EVENT_WRITE, 1);
+         OUT_RING(ring, 0x00);  /* VS_DEALLOC */
+         OUT_PKT3(ring, CP_EVENT_WRITE, 1);
+         OUT_RING(ring, 0x01);  /* PS_DEALLOC */
+      }
+   }
+}
+
 /* before first tile */
 static void
 fd2_emit_tile_init(struct fd_batch *batch) assert_dt
@@ -1453,4 +1517,5 @@ fd2_gmem_init(struct pipe_context *pctx) disable_thread_safety_analysis
    ctx->emit_tile_mem2gmem = fd2_emit_tile_mem2gmem;
    ctx->emit_tile_renderprep = fd2_emit_tile_renderprep;
    ctx->emit_tile_gmem2mem = fd2_emit_tile_gmem2mem;
+   ctx->emit_tile_fini = fd2_emit_tile_fini;
 }
