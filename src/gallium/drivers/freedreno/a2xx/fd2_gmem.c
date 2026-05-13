@@ -418,8 +418,10 @@ fd2_emit_tile_mem2gmem(struct fd_batch *batch,
 
    /* A22X: Cache flush after mem2gmem draws as per blob driver behavior.
     * This ensures texture data written to GMEM is coherent before rendering.
+    *
+    * Gated on FD2_NO_CACHE_FLUSH_INV for the 0x0ee2 cycle-counter bisect.
     */
-   if (!is_a20x(ctx->screen)) {
+   if (!is_a20x(ctx->screen) && !getenv("FD2_NO_CACHE_FLUSH_INV")) {
       OUT_PKT3(ring, CP_EVENT_WRITE, 1);
       OUT_RING(ring, CACHE_FLUSH_AND_INV_EVENT);
    }
@@ -638,6 +640,21 @@ fd2_emit_tile_fini(struct fd_batch *batch) assert_dt
          OUT_RING(ring, 0x00);  /* VS_DEALLOC */
          OUT_PKT3(ring, CP_EVENT_WRITE, 1);
          OUT_RING(ring, 0x01);  /* PS_DEALLOC */
+      }
+   }
+
+   /* FD2_END_CACHE_FLUSH_INV_COUNT=N: emit N extra
+    * CACHE_FLUSH_AND_INV_EVENT at end of tile loop.
+    * Tests whether 0x16 itself is what advances 0x0ee2 by
+    * +0x00020200/render.  If yes, emitting 14 here should wrap
+    * the counter mod-16 and pin the cycle.
+    */
+   const char *cfi_env = getenv("FD2_END_CACHE_FLUSH_INV_COUNT");
+   if (cfi_env) {
+      int n = atoi(cfi_env);
+      for (int i = 0; i < n; i++) {
+         OUT_PKT3(ring, CP_EVENT_WRITE, 1);
+         OUT_RING(ring, 0x16);  /* CACHE_FLUSH_AND_INV_EVENT */
       }
    }
 }

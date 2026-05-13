@@ -427,9 +427,29 @@ fd2_emit_restore(struct fd_context *ctx, struct fd_ringbuffer *ring)
     * Same event is already used in fd2_draw.c with count=1, so
     * this is the proven-safe form for A22X.
     */
-   if (!is_a20x(ctx->screen)) {
+   /* Test toggles for 0x0ee2 cycle-counter advance bisect (2026-05-13):
+    *   FD2_NO_CACHE_FLUSH_INV=1   skip this CACHE_FLUSH_AND_INV_EVENT
+    *                              (and the per-tile one in fd2_gmem.c).
+    *                              Tests whether event 0x16 is what
+    *                              advances 0x0ee2 by +0x00020200/render.
+    *   FD2_START_NOP_COUNT=N      emit N extra CP_NOP packets here at
+    *                              start of submit.  Tests whether the
+    *                              advance is per-packet rather than
+    *                              per-specific-opcode.
+    */
+   if (!is_a20x(ctx->screen) && !getenv("FD2_NO_CACHE_FLUSH_INV")) {
       OUT_PKT3(ring, CP_EVENT_WRITE, 1);
       OUT_RING(ring, CACHE_FLUSH_AND_INV_EVENT);
+   }
+   {
+      const char *nop_env = getenv("FD2_START_NOP_COUNT");
+      if (nop_env) {
+         int n = atoi(nop_env);
+         for (int i = 0; i < n; i++) {
+            OUT_PKT3(ring, CP_NOP, 0);
+            OUT_RING(ring, 0x00000000);
+         }
+      }
    }
 
    if (is_a20x(ctx->screen)) {
