@@ -580,6 +580,74 @@ fd2_emit_sysmem_prep(struct fd_batch *batch)
    fd_context_all_dirty(ctx);
 }
 
+/* emit_vsc_reg_save: KGSL-parity CP_REG_TO_MEM sequence for VSC_PIPE registers
+ *
+ * Legacy KGSL build_reg_save_cmds (kgsl_drawctxt.c::620-630) emits this
+ * sequence between every user IB as part of context-switch save:
+ *
+ *   if (chip_id == LEIA_REV470) {
+ *       for (i = REG_LEIA_VSC_BIN_SIZE; i <= REG_LEIA_VSC_PIPE_DATA_LENGTH_7; i++) {
+ *           *cmd++ = pm4_type3_packet(PM4_REG_TO_MEM, 2);
+ *           *cmd++ = i;
+ *           *cmd++ = ctx->reg_values[j++];
+ *       }
+ *   }
+ *
+ * Hypothesis: CP execution of these REG_TO_MEM packets has the side
+ * effect of advancing the binner state machine through 0x7f-namespace
+ * transitions in register 0x0ee2 - transitions that mainline Mesa only
+ * sees the 0x15-namespace of (producing the period-16 cycle).
+ *
+ * Range emitted: VSC_BIN_SIZE (0x0c01) + per-pipe CONFIG/DATA_ADDRESS/
+ * DATA_LENGTH for 8 pipes (0x0c06..0x0c1d) = 25 reads.
+ *
+ * Target: fd2_ctx->vsc_regsave_mem scratch BO, 256 bytes, allocated
+ * lazily on first call.
+ *
+ * Two emission positions gated independently:
+ *   FD2_EMIT_VSC_REG_SAVE=1        emit at END of tile loop (in
+ *                                  fd2_emit_tile_fini, AFTER all draws)
+ *   FD2_EMIT_VSC_REG_SAVE_START=1  emit at START of batch (in
+ *                                  fd2_emit_tile_init, BEFORE binning
+ *                                  IB).  Matches KGSL's "save before
+ *                                  next user IB" timing.
+ *
+ * Position-END was tested 2026-05-13 and falsified (no 0x7f visit, no
+ * pin).  Position-START matches KGSL's actual timing where reg_save
+ * runs while binner state is still active from previous render.
+ */
+static void
+emit_vsc_reg_save(struct fd_batch *batch, struct fd_ringbuffer *ring) assert_dt
+{
+   struct fd_context *ctx = batch->ctx;
+   struct fd2_context *fd2_ctx = fd2_context(ctx);
+
+   if (!fd2_ctx->vsc_regsave_mem) {
+      fd2_ctx->vsc_regsave_mem =
+         fd_bo_new(ctx->screen->dev, 256, 0, "vsc_regsave");
+   }
+   if (!fd2_ctx->vsc_regsave_mem)
+      return;
+
+   /* VSC_BIN_SIZE @ 0x0c01 -> offset 0 */
+   OUT_PKT3(ring, CP_REG_TO_MEM, 2);
+   OUT_RING(ring, REG_A2XX_A220_VSC_BIN_SIZE);
+   OUT_RELOC(ring, fd2_ctx->vsc_regsave_mem, 0, 0, 0);
+
+   /* Per-pipe VSC_PIPE_CONFIG / DATA_ADDRESS / DATA_LENGTH for 8 pipes */
+   for (int p = 0; p < 8; p++) {
+      OUT_PKT3(ring, CP_REG_TO_MEM, 2);
+      OUT_RING(ring, REG_A2XX_VSC_PIPE_CONFIG(p));
+      OUT_RELOC(ring, fd2_ctx->vsc_regsave_mem, 4 + p * 12, 0, 0);
+      OUT_PKT3(ring, CP_REG_TO_MEM, 2);
+      OUT_RING(ring, REG_A2XX_VSC_PIPE_DATA_ADDRESS(p));
+      OUT_RELOC(ring, fd2_ctx->vsc_regsave_mem, 8 + p * 12, 0, 0);
+      OUT_PKT3(ring, CP_REG_TO_MEM, 2);
+      OUT_RING(ring, REG_A2XX_VSC_PIPE_DATA_LENGTH(p));
+      OUT_RELOC(ring, fd2_ctx->vsc_regsave_mem, 12 + p * 12, 0, 0);
+   }
+}
+
 /* end of tile loop - emit "release slot" events to deallocate the 16-entry
  * VPC / TC / faceness pool that the GPU consumes one slot of per Mesa batch.
  *
@@ -685,56 +753,12 @@ fd2_emit_tile_fini(struct fd_batch *batch) assert_dt
       }
    }
 
-   /* FD2_EMIT_VSC_REG_SAVE=1: emit CP_REG_TO_MEM packets for VSC_PIPE
-    * registers at end of tile loop, mirroring legacy KGSL's
-    * build_reg_save_cmds A22X path (kgsl_drawctxt.c lines 620-630):
-    *
-    *   if (chip_id == LEIA_REV470) {
-    *       for (i = REG_LEIA_VSC_BIN_SIZE; i <= REG_LEIA_VSC_PIPE_DATA_LENGTH_7; i++) {
-    *           *cmd++ = pm4_type3_packet(PM4_REG_TO_MEM, 2);
-    *           *cmd++ = i;
-    *           *cmd++ = ctx->reg_values[j++];
-    *       }
-    *   }
-    *
-    * KGSL emits these REG_TO_MEM packets BETWEEN every user IB as part
-    * of context-switch save.  The CP's execution of REG_TO_MEM has the
-    * side effect of advancing the binner state machine through
-    * 0x7f-namespace transitions in 0x0ee2 that mainline Mesa never
-    * produces - and is the most likely cause of the period-16 cycle.
-    *
-    * Range emitted: VSC_BIN_SIZE (0x0c01) + per-pipe CONFIG/DATA_ADDR/
-    * DATA_LEN for 8 pipes (0x0c06..0x0c1d) = 25 register reads total.
-    *
-    * Cost: 25 CP_REG_TO_MEM packets * 3 dwords = 75 extra dwords per
-    * batch.  Scratch BO (vsc_regsave_mem) is allocated lazily on first
-    * use and reused for all subsequent batches - no per-batch malloc.
-    */
+   /* End-of-tile-loop VSC reg-save emission (FD2_EMIT_VSC_REG_SAVE=1
+    * env var).  See emit_vsc_reg_save() function above for full
+    * rationale and recipe details.  End position falsified 2026-05-13
+    * but kept for direct comparison with start-position variant. */
    if (is_a22x(ctx->screen) && getenv("FD2_EMIT_VSC_REG_SAVE")) {
-      struct fd2_context *fd2_ctx = fd2_context(ctx);
-      if (!fd2_ctx->vsc_regsave_mem) {
-         fd2_ctx->vsc_regsave_mem = fd_bo_new(
-            ctx->screen->dev, 256, 0, "vsc_regsave");
-      }
-      if (fd2_ctx->vsc_regsave_mem) {
-         /* VSC_BIN_SIZE @ 0x0c01 -> offset 0 */
-         OUT_PKT3(ring, CP_REG_TO_MEM, 2);
-         OUT_RING(ring, REG_A2XX_A220_VSC_BIN_SIZE);
-         OUT_RELOC(ring, fd2_ctx->vsc_regsave_mem, 0, 0, 0);
-         /* Per-pipe VSC_PIPE_CONFIG / DATA_ADDRESS / DATA_LENGTH
-          * @ 0x0c06..0x0c1d (0x18 = 3 regs x 8 pipes) -> offsets 4..96 */
-         for (int p = 0; p < 8; p++) {
-            OUT_PKT3(ring, CP_REG_TO_MEM, 2);
-            OUT_RING(ring, REG_A2XX_VSC_PIPE_CONFIG(p));
-            OUT_RELOC(ring, fd2_ctx->vsc_regsave_mem, 4 + p * 12, 0, 0);
-            OUT_PKT3(ring, CP_REG_TO_MEM, 2);
-            OUT_RING(ring, REG_A2XX_VSC_PIPE_DATA_ADDRESS(p));
-            OUT_RELOC(ring, fd2_ctx->vsc_regsave_mem, 8 + p * 12, 0, 0);
-            OUT_PKT3(ring, CP_REG_TO_MEM, 2);
-            OUT_RING(ring, REG_A2XX_VSC_PIPE_DATA_LENGTH(p));
-            OUT_RELOC(ring, fd2_ctx->vsc_regsave_mem, 12 + p * 12, 0, 0);
-         }
-      }
+      emit_vsc_reg_save(batch, ring);
    }
 }
 
@@ -769,6 +793,18 @@ fd2_emit_tile_init(struct fd_batch *batch) assert_dt
     */
    OUT_PKT0(ring, REG_AXXX_CP_SCRATCH_REG0, 1);
    OUT_RING(ring, 0x10001);
+
+   /* FD2_EMIT_VSC_REG_SAVE_START=1: emit KGSL-parity CP_REG_TO_MEM for
+    * VSC_PIPE registers AT THE VERY START of the batch (before any
+    * other state restoration).  Matches KGSL's "context-switch save
+    * before next user IB" timing where reg_save runs while the binner
+    * may still be in active state from the prior render.
+    * End-position variant (FD2_EMIT_VSC_REG_SAVE) tested + falsified
+    * 2026-05-13; this start-position variant tests KGSL's actual
+    * placement. */
+   if (is_a22x(ctx->screen) && getenv("FD2_EMIT_VSC_REG_SAVE_START")) {
+      emit_vsc_reg_save(batch, ring);
+   }
 
    fd2_emit_restore(ctx, ring);
 
