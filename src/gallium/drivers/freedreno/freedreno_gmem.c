@@ -670,6 +670,151 @@ render_sysmem(struct fd_batch *batch) assert_dt
       ctx->emit_sysmem_fini(batch);
 }
 
+/* v10 0099 v5a: A22X per-IB cycle-counter alignment - add zero-vertex
+ * CP_DRAW_INDX to dummy IB to test draw-vs-ioctl counter advance.
+ *
+ * The Adreno 220 has an internal state-cycle counter that advances by
+ * exactly +1 per IOCTL_KGSL_RINGBUFFER_ISSUEIBCMDS (= per Mesa
+ * fd_submit_flush()), period 16.  webOS strace (2026-05-13, kernel
+ * repo reports/webos-strace-2026-05-13/) shows webOS's libGLESv2
+ * issues 16 such ioctls per render, wrapping the counter to phase 0
+ * every render and producing no visible cycle.  Mainline Mesa
+ * freedreno's Fork A/B path emits exactly one ioctl per render, so
+ * the counter advances +1/render -> walks all 16 phases over 16
+ * consecutive renders -> visible period-16 cycle.
+ *
+ * v1 (pre-submit, bare CP_NOP) and v2 (pre-submit, with cache-flush
+ * body + rb lifecycle fix) both hung the GPU on the first dummy at
+ * every multiplier >= 2 (80 hangchecks each).  Pre-real-submit
+ * injection is structurally broken.
+ *
+ * v3 (post-submit, no wait) ran without hangs but FAILED to pin the
+ * cycle phase - multiplier=16 gave 5 unique hashes per 5 caps,
+ * shifted by 1 phase vs multiplier=1.  Effective advance was ~1 per
+ * cap regardless of multiplier.
+ *
+ * v4 added fd_fence_wait() between dummies (force GPU to retire each)
+ * - immediately hung the GPU on every multiplier >= 2.  Proved the
+ * dummies DO reach the GPU but don't complete properly.
+ *
+ * v5a falsifier: keep v3's no-wait approach but add a zero-vertex
+ * CP_DRAW_INDX (point list, 0 indices) to each dummy IB1.  Tests the
+ * hypothesis that the per-IB cycle counter advances per draw packet
+ * (not per arbitrary MSM_SUBMIT ioctl).  webOS's 16 ioctls per render
+ * each carry real tile draws - if draws are the trigger, v5a should
+ * pin the phase at multiplier=16.  If v5a still doesn't pin, the
+ * counter is driven by something else entirely (state setup, resolve
+ * EVENT_WRITE_TS, or specific register writes) and multi-flush is
+ * dead - pivot to per-tile split or kernel-side counter dump.
+ *
+ * v3 base design (kept): dummies happen AFTER fd_submit_flush() on
+ * the real submit.  The real batch runs unchanged.  After it returns its
+ * fence, we issue (multiplier - 1) dummy MSM_SUBMITs.  The next
+ * render's real submit then lands at base + multiplier mod 16 =
+ * base (when multiplier=16), giving every render the same cycle
+ * phase.  GPU counter resets to phase 0 on kernel boot, so the
+ * locked phase post-boot is phase 0 (= 5adc3160 = correct).
+ *
+ * Tunable via env-var FD2_FLUSH_MULTIPLIER=<n>:
+ *   n=0/1 -> control / disable (period-16 cycle reappears)
+ *   n=2   -> period-8 cycle (every 8th render correct)
+ *   n=8   -> period-2 cycle (every other render correct)
+ *   n=16  -> default, every render correct
+ *   n=32  -> two full wraps, every render correct
+ *
+ * Only fires for is_a22x(screen).  Cost: 15 extra MSM_SUBMIT
+ * ioctls per real render (~10-100 us each, worst case ~1.5 ms
+ * extra per frame).
+ *
+ * Each dummy IB1 (4 dwords):
+ *   CP_EVENT_WRITE CACHE_FLUSH_AND_INV_EVENT  (A2XX event 0x16,
+ *                                              same as
+ *                                              fd2_emit_tile_renderprep)
+ *   CP_NOP 0x00000000
+ *
+ * Ringbuffer lifecycle: fd_ringbuffer_del(rb) before fd_submit_del
+ * (dummy) per freedreno_ringbuffer.h contract.
+ */
+static void
+fd_a22x_multi_flush_align(struct fd_batch *batch)
+{
+   struct fd_screen *screen = batch->ctx->screen;
+
+   if (FD_DBG(NOHW))
+      return;
+   if (!is_a22x(screen))
+      return;
+
+   int multiplier = 16;
+   const char *e = getenv("FD2_FLUSH_MULTIPLIER");
+   if (e)
+      multiplier = atoi(e);
+   if (multiplier <= 1)
+      return;
+
+   bool dbg = getenv("FD2_FLUSH_DEBUG") != NULL;
+   int n_submit_ok = 0, n_submit_null = 0;
+
+   for (int i = 0; i < multiplier - 1; i++) {
+      struct fd_submit *dummy = fd_submit_new(batch->ctx->pipe);
+      if (!dummy)
+         break;
+      struct fd_ringbuffer *rb =
+         fd_submit_new_ringbuffer(dummy, 64, FD_RINGBUFFER_PRIMARY);
+      if (!rb) {
+         fd_submit_del(dummy);
+         break;
+      }
+      /* CACHE_FLUSH_AND_INV_EVENT (A2XX, 0x16): same event the A22X
+       * mem2gmem path in fd2_emit_tile_renderprep emits for coherency.
+       * Gives the dummy IB1 a real work item the CP can retire. */
+      OUT_PKT3(rb, CP_EVENT_WRITE, 1);
+      OUT_RING(rb, 0x16);  /* CACHE_FLUSH_AND_INV_EVENT */
+      OUT_PKT3(rb, CP_NOP, 0);
+      OUT_RING(rb, 0x00000000);
+
+      /* v5a: zero-vertex CP_DRAW_INDX (point list) to test whether
+       * the per-IB cycle counter advances per draw packet (vs per
+       * MSM_SUBMIT ioctl).  v3 fired 15 dummies without draws and
+       * the counter only advanced once per render - suggesting the
+       * counter is NOT per-ioctl after all.  webOS's 16 ioctls per
+       * render each carry actual tile draws.
+       *
+       * Encoding: CP_DRAW_INDX, 3 dword payload.  DRAW() bitfield
+       * (freedreno_util.h DRAW()):
+       *   prim_type=DI_PT_POINTLIST(9), source_select=AUTO_INDEX(2),
+       *   index_size=IGN(0), vis_cull_mode=IGNORE_VISIBILITY(0),
+       *   instances=0, fixed bit 14 set -> 0x4089.
+       * num_indices=0 -> GPU consumes the draw packet but rasterises
+       * nothing.  No state setup required (the draw context is
+       * whatever the real submit left behind, which is irrelevant
+       * for zero vertices). */
+      OUT_PKT3(rb, CP_DRAW_INDX, 3);
+      OUT_RING(rb, 0x00000000);     /* viz query info */
+      OUT_RING(rb, 0x00004089);     /* DRAW(POINTLIST, AUTO_IDX, IGN, IGN_VIS, 0) */
+      OUT_RING(rb, 0x00000000);     /* num_indices = 0 */
+
+      struct fd_fence *df = fd_submit_flush(dummy, -1, false);
+      if (df) {
+         n_submit_ok++;
+         fd_fence_del(df);
+      } else {
+         n_submit_null++;
+      }
+
+      /* freedreno_ringbuffer.h: all rb's must be unref'd before
+       * fd_submit_del. */
+      fd_ringbuffer_del(rb);
+      fd_submit_del(dummy);
+   }
+
+   if (dbg) {
+      fprintf(stderr, "[fd_a22x_multi_flush_align] mult=%d submit_ok=%d "
+              "submit_null=%d\n",
+              multiplier, n_submit_ok, n_submit_null);
+   }
+}
+
 static void
 flush_ring(struct fd_batch *batch)
 {
@@ -685,6 +830,12 @@ flush_ring(struct fd_batch *batch)
    } else {
       fence = fd_submit_flush(batch->submit, batch->in_fence_fd, use_fence_fd);
    }
+
+   /* v10 0099 v3: align A22X per-IB cycle counter via N-1 dummy
+    * ISSUEIBCMDS AFTER the real submit.  Pre-submit injection (v1/v2)
+    * hung the GPU.  See block comment above fd_a22x_multi_flush_align().
+    */
+   fd_a22x_multi_flush_align(batch);
 
    if (batch->fence) {
       fd_pipe_fence_set_submit_fence(batch->fence, fence);
