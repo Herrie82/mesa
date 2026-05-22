@@ -20,6 +20,11 @@
 static void
 fd2_context_destroy(struct pipe_context *pctx) in_dt
 {
+   struct fd2_context *fd2_ctx = fd2_context(fd_context(pctx));
+
+   if (fd2_ctx->vsc_size_mem)
+      fd_bo_del(fd2_ctx->vsc_size_mem);
+
    fd_context_destroy(pctx);
    free(pctx);
 }
@@ -86,6 +91,13 @@ fd2_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
 
    /* construct vertex state used for solid ops (clear, and gmem<->mem) */
    fd2_ctx->solid_vertexbuf = create_solid_vertexbuf(pctx);
+
+   /* A22X: feedback buffer for the hardware VSC tile-binner's per-pipe
+    * visibility-stream byte counts (VSC_SIZE_ADDRESS). a20x doesn't use
+    * the VSC binner this way, so only allocate on a22x.
+    */
+   if (is_a22x(screen))
+      fd2_ctx->vsc_size_mem = fd_bo_new(screen->dev, 0x1000, 0, "vsc_size");
 
    fd2_query_context_init(pctx);
 

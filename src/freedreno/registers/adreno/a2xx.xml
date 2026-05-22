@@ -1213,8 +1213,21 @@ xsi:schemaLocation="https://gitlab.freedesktop.org/freedreno/ rules-fd.xsd">
 		<bitfield name="WIDTH" low="0" high="4" shr="5" type="uint"/>
 		<bitfield name="HEIGHT" low="5" high="9" shr="5" type="uint"/>
 	</reg32>
+	<reg32 offset="0x0c02" name="VSC_SIZE_ADDRESS"/>
 	<array offset="0x0c06" name="VSC_PIPE" stride="3" length="8">
-		<reg32 offset="0x0" name="CONFIG"/>
+		<reg32 offset="0x0" name="CONFIG">
+			<doc>
+				Same layout as a3xx: the A220 VSC tile-binner is the
+				a3xx binner. X/Y specify the bin index in the
+				horiz/vert direction (0,0 is upper left); W/H specify
+				the number of bins assigned to this VSC_PIPE in the
+				horiz/vert dimension.
+			</doc>
+			<bitfield name="X" low="0" high="9" type="uint"/>
+			<bitfield name="Y" low="10" high="19" type="uint"/>
+			<bitfield name="W" low="20" high="23" type="uint"/>
+			<bitfield name="H" low="24" high="27" type="uint"/>
+		</reg32>
 		<reg32 offset="0x1" name="DATA_ADDRESS"/>
 		<reg32 offset="0x2" name="DATA_LENGTH"/>
 	</array>

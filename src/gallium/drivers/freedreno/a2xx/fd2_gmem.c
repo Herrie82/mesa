@@ -462,6 +462,86 @@ fd2_emit_sysmem_prep(struct fd_batch *batch)
    util_dynarray_clear(&batch->shader_patches);
 }
 
+/*
+ * Configure the A220 hardware VSC tile-binner.
+ *
+ * Unlike a20x (which freedreno drives with a memexport visibility shader
+ * + separate binning IB) the A220 VSC binner is the same block as a3xx and
+ * is *always in the primitive path*. freedreno never programmed it, so it
+ * came up with garbage power-on pipe state and corrupted tile coverage —
+ * the deterministic "period-8" cycle where 7 of 8 otherwise-identical
+ * renders dropped subsets of GMEM tiles.
+ *
+ * The proprietary webOS stack renders correctly on the same silicon by
+ * fully configuring the VSC at context/render setup (register capture in
+ * the kernel reports): VSC_BIN_SIZE, the 8 VSC_PIPE config/addr/len
+ * triples with backing BOs, and VSC_SIZE_ADDRESS — yet it issues only
+ * plain DRAW_INDX, never DRAW_INDX_BIN, and runs no separate binning pass.
+ * The vis-streams it produces are non-empty, i.e. the binner runs during
+ * the normal draw. So the fix is to give the binner valid state, not to
+ * add a binning pass.
+ *
+ * We reuse freedreno's own per-pipe bin layout (gmem->vsc_pipe[], computed
+ * for every GMEM setup) so the binner's notion of bins matches the SW tile
+ * loop exactly. VSC_PIPE.CONFIG / VSC_BIN_SIZE encodings are identical to
+ * a3xx (this mirrors fd3_gmem.c update_vsc_pipe()); the captured webOS
+ * values (BIN_SIZE 0x108 for 256x256, 0x187 for 224x384, PIPE_CONFIG
+ * X[0:9] Y[10:19] W[20:23] H[24:27]) confirm the layout.
+ *
+ * Note: webOS also pulses SQ_GPR_MANAGEMENT=0x0007f010 (VTX=127,PIX=1)
+ * here, but that is its binning-shader GPR split; with PIX=1 it would
+ * starve our real pixel shaders. freedreno relies on the kernel's static
+ * 0x00040400 (VTX=64,PIX=64) and runs no binning shader, so we
+ * deliberately leave SQ_GPR_MANAGEMENT alone.
+ */
+static void
+emit_vsc_config(struct fd_batch *batch) assert_dt
+{
+   struct fd_context *ctx = batch->ctx;
+   struct fd2_context *fd2_ctx = fd2_context(ctx);
+   const struct fd_gmem_stateobj *gmem = batch->gmem_state;
+   struct fd_ringbuffer *ring = batch->gmem;
+   int i;
+
+   /* bin dimensions (already 32-aligned and sized to fit color[+depth] in
+    * GMEM by freedreno_gmem.c — the same budget constraint webOS uses) */
+   OUT_PKT0(ring, REG_A2XX_A220_VSC_BIN_SIZE, 1);
+   OUT_RING(ring, A2XX_A220_VSC_BIN_SIZE_WIDTH(gmem->bin_w) |
+                     A2XX_A220_VSC_BIN_SIZE_HEIGHT(gmem->bin_h));
+
+   /* feedback buffer for per-pipe vis-stream byte counts */
+   OUT_PKT0(ring, REG_A2XX_VSC_SIZE_ADDRESS, 1);
+   OUT_RELOC(ring, fd2_ctx->vsc_size_mem, 0, 0, 0);
+
+   /* 8 pipes: CONFIG (bin x/y/w/h) + backing BO address + length.
+    * 256 KB per pipe matches the captured webOS DATA_LENGTH (0x40000)
+    * and a3xx. Unused pipes (>= num_vsc_pipes) are zeroed in gmem and
+    * get CONFIG=0, which is harmless. */
+   for (i = 0; i < 8; i++) {
+      const struct fd_vsc_pipe *pipe = &gmem->vsc_pipe[i];
+
+      if (!ctx->vsc_pipe_bo[i]) {
+         ctx->vsc_pipe_bo[i] =
+            fd_bo_new(ctx->dev, 0x40000, 0, "vsc_pipe[%u]", i);
+      }
+
+      OUT_PKT0(ring, REG_A2XX_VSC_PIPE(i), 3);
+      OUT_RING(ring, A2XX_VSC_PIPE_CONFIG_X(pipe->x) |
+                        A2XX_VSC_PIPE_CONFIG_Y(pipe->y) |
+                        A2XX_VSC_PIPE_CONFIG_W(pipe->w) |
+                        A2XX_VSC_PIPE_CONFIG_H(pipe->h));
+      OUT_RELOC(ring, ctx->vsc_pipe_bo[i], 0, 0, 0); /* DATA_ADDRESS */
+      OUT_RING(ring,
+               fd_bo_size(ctx->vsc_pipe_bo[i]) - 32); /* DATA_LENGTH */
+   }
+
+   /* Enable the binner. webOS drives LRZ_VSC_CONTROL=3 transiently while
+    * configuring and settles to 1 for steady render; 1 is the run value. */
+   OUT_PKT3(ring, CP_SET_CONSTANT, 2);
+   OUT_RING(ring, CP_REG(REG_A2XX_A220_RB_LRZ_VSC_CONTROL));
+   OUT_RING(ring, 0x00000001);
+}
+
 /* before first tile */
 static void
 fd2_emit_tile_init(struct fd_batch *batch) assert_dt
@@ -642,6 +722,13 @@ fd2_emit_tile_init(struct fd_batch *batch) assert_dt
    } else {
       patch_draws(batch, IGNORE_VISIBILITY);
    }
+
+   /* A22X: program the always-on hardware VSC tile-binner with valid pipe
+    * state. Independent of the a20x use_hw_binning() path above — we keep
+    * plain DRAW_INDX (IGNORE_VISIBILITY) and add no binning pass; this just
+    * stops the binner corrupting tile coverage. See emit_vsc_config(). */
+   if (is_a22x(ctx->screen))
+      emit_vsc_config(batch);
 
    util_dynarray_clear(&batch->draw_patches);
    util_dynarray_clear(&batch->shader_patches);
