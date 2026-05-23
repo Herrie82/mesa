@@ -525,9 +525,10 @@ gmem_key_init(struct fd_batch *batch, bool assume_zs, bool no_scis_opt)
       key->height = scissor->maxy + 1 - key->miny;
    }
 
-   if (is_a20x(screen) && batch->cleared) {
+   if (is_a2xx(screen) && batch->cleared) {
       /* under normal circumstances the requirement would be 4K
        * but the fast clear path requires an alignment of 32K
+       * (a22x uses the fast clear too - see fd2_clear_fast)
        */
       key->gmem_page_align = 8;
    } else if (is_a6xx(screen)) {

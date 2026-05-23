@@ -445,8 +445,15 @@ fd2_clear_fast(struct fd_context *ctx, unsigned buffers,
    int depth_size = -1; /* -1: no clear, 0: clear 16-bit, 1: clear 32-bit */
    int color_size = -1;
 
-   /* TODO: need to test performance on a22x */
-   if (!is_a20x(ctx->screen))
+   /*
+    * Enable the HW fast-clear for A22X too. The non-fast clear-quad path does
+    * NOT clear the GMEM tiles on A220 (the background comes out unwritten,
+    * 0,0,0,0 = transparent/"white"), so the fast clear (which clears GMEM via
+    * CLEAR_COLOR + RB_COPY_CONTROL) is the only working GMEM clear. Note this
+    * path uses CP_LOAD_CONSTANT_CONTEXT (below) which has been a hang hazard
+    * on a2xx - watch for GPU lockups.
+    */
+   if (!is_a2xx(ctx->screen))
       return false;
 
    if (buffers & PIPE_CLEAR_COLOR)
