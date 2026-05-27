@@ -821,6 +821,27 @@ fd2_emit_tile_renderprep(struct fd_batch *batch,
    struct pipe_framebuffer_state *pfb = &batch->framebuffer;
    enum pipe_format format = pipe_surface_format(&pfb->cbufs[0]);
 
+   /* A22X: the per-tile state reprogramming below (RB_COLOR_INFO, window
+    * offset/scissor, ...) races this tile's mem2gmem restore and the
+    * previous tile's gmem2mem resolve, which are still in flight -- there
+    * is no implicit sync between tiles. On heavy depth/restore scenes
+    * (e.g. glmark2 desktop: 16 bins, batch_restore=20) that race leaves the
+    * 3D back-end stuck busy (hangcheck "gpu lockup" with the fence still
+    * creeping). The per-draw CACHE_FLUSH_TS+WFI does not cover the restore/
+    * resolve blits, so serialise tiles here: wait for the GPU to go idle
+    * before reprogramming. A plain OUT_WFI is insufficient on A22X (see the
+    * pre-draw VGT-DMA RBBM_STATUS poll in fd2_draw.c), so reuse the same
+    * RBBM_STATUS poll, waiting for GUI_ACTIVE (bit 31) to clear -- i.e. the
+    * previous tile's draws + resolve have fully drained. (Idle RBBM_STATUS
+    * reads 0x110; busy reads 0xc40103xx.) */
+   if (is_a22x(ctx->screen)) {
+      OUT_PKT3(ring, CP_WAIT_REG_EQ, 4);
+      OUT_RING(ring, 0x000005d0); /* RBBM_STATUS */
+      OUT_RING(ring, 0x00000000); /* reference value: idle */
+      OUT_RING(ring, 0x80000000); /* mask: GUI_ACTIVE */
+      OUT_RING(ring, 0x00000001); /* poll interval */
+   }
+
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
    OUT_RING(ring, CP_REG(REG_A2XX_RB_COLOR_INFO));
    OUT_RING(ring, A2XX_RB_COLOR_INFO_SWAP(fmt2swap(format)) |
