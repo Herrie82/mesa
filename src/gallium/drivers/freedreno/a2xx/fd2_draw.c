@@ -30,34 +30,20 @@ pack_rgba(enum pipe_format format, const float *rgba)
 }
 
 static void
-emit_cacheflush(struct fd_context *ctx, struct fd_ringbuffer *ring)
+emit_cacheflush(struct fd_ringbuffer *ring)
 {
-   struct fd2_context *fd2_ctx = fd2_context(ctx);
-
-   if (is_a22x(ctx->screen) && fd2_ctx->scratch_buf) {
-      /* A22X: CACHE_FLUSH_TS writes a timestamp to memory when the flush
-       * completes; the following WFI drains the whole pipeline (including
-       * that write). The plain 12x async CACHE_FLUSH below does NOT wait,
-       * which on A220 lets the per-tile gmem2mem resolve race ahead of the
-       * draw's GMEM writes on heavy multi-bin scenes -> stale data / wedge.
-       * This mirrors the legacy KGSL CACHE_FLUSH_TS pattern.
-       */
-      struct fd_bo *scratch_bo = fd_resource(fd2_ctx->scratch_buf)->bo;
-      uint32_t seqno = ++fd2_ctx->cache_flush_seqno;
-
-      OUT_PKT3(ring, CP_EVENT_WRITE, 3);
-      OUT_RING(ring, CACHE_FLUSH_TS);
-      OUT_RELOC(ring, scratch_bo, 0, 0, 0); /* address to write timestamp */
-      OUT_RING(ring, seqno);                /* value to write */
-
-      OUT_WFI(ring);
-   } else {
-      unsigned i;
-      /* A20X: async cache flush (original behavior) */
-      for (i = 0; i < 12; i++) {
-         OUT_PKT3(ring, CP_EVENT_WRITE, 1);
-         OUT_RING(ring, CACHE_FLUSH);
-      }
+   unsigned i;
+   /* Light async cache flush per draw (no pipeline drain) on BOTH a20x and
+    * a22x. The STRONG CACHE_FLUSH_TS+WFI that serialises a tile's draws
+    * against its gmem2mem resolve is emitted ONCE PER TILE in
+    * prepare_tile_fini_ib (a22x), not per draw. Draining the whole pipeline
+    * per draw (the original A22X fix) was correct but crippled heavy
+    * multi-bin scenes: draws x 16 tiles full pipeline stalls -> ~1 fps. The
+    * resolve race only needs the draws drained before the resolve READS
+    * gmem, which is a per-tile boundary, not a per-draw one. */
+   for (i = 0; i < 12; i++) {
+      OUT_PKT3(ring, CP_EVENT_WRITE, 1);
+      OUT_RING(ring, CACHE_FLUSH);
    }
 }
 
@@ -162,7 +148,7 @@ draw_impl(struct fd_context *ctx, const struct pipe_draw_info *info,
       OUT_RING(ring, 0x00000000);
    }
 
-   emit_cacheflush(ctx, ring);
+   emit_cacheflush(ring);
 }
 
 static bool

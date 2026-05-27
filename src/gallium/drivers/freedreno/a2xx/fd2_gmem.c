@@ -189,11 +189,25 @@ prepare_tile_fini_ib(struct fd_batch *batch) assert_dt
    OUT_RING(ring, fui((float)gmem->bin_h / 2.0f)); /* YSCALE */
    OUT_RING(ring, fui((float)gmem->bin_h / 2.0f)); /* YOFFSET */
 
-   /* A22X: WFI before changing RB_MODECONTROL to ensure pipeline is idle.
-    * Mode transitions between COLOR_DEPTH and EDRAM_COPY require sync.
-    */
-   if (!is_a20x(ctx->screen))
+   /* A22X: STRONG drain before the EDRAM_COPY resolve. The tile's draws must
+    * have fully landed in GMEM before the resolve reads it back; a plain
+    * OUT_WFI is insufficient on A220 (it does not wait for VGT DMA). Use
+    * CACHE_FLUSH_TS + WFI, ONCE per tile here -- this is the per-tile
+    * boundary that the resolve race actually needs, and it REPLACES the
+    * per-draw drain (which serialised every draw and crippled heavy
+    * multi-bin scenes to ~1 fps). The mode transition COLOR_DEPTH<->EDRAM_COPY
+    * also needs this sync. (This IB is built once and replayed per tile, so
+    * the flush runs once per tile, draining that tile's draws.) */
+   if (!is_a20x(ctx->screen)) {
+      if (fd2_ctx->scratch_buf) {
+         struct fd_bo *scratch_bo = fd_resource(fd2_ctx->scratch_buf)->bo;
+         OUT_PKT3(ring, CP_EVENT_WRITE, 3);
+         OUT_RING(ring, CACHE_FLUSH_TS);
+         OUT_RELOC(ring, scratch_bo, 0, 0, 0); /* timestamp address */
+         OUT_RING(ring, ++fd2_ctx->cache_flush_seqno);
+      }
       OUT_WFI(ring);
+   }
 
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
    OUT_RING(ring, CP_REG(REG_A2XX_RB_MODECONTROL));
