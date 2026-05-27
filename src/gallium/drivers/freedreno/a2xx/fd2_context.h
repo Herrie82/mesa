@@ -24,6 +24,14 @@ struct fd2_context {
     * Only allocated/used on a22x. See fd2_gmem.c emit_vsc_config().
     */
    struct fd_bo *vsc_size_mem;
+
+   /* Scratch buffer for A22X cache flush timestamp verification.
+    * CACHE_FLUSH_TS writes a timestamp here when the flush completes,
+    * and the following WFI drains the pipeline so the per-tile resolve
+    * can't race ahead of the draw's GMEM writes. Only used on a22x.
+    */
+   struct pipe_resource *scratch_buf;
+   uint32_t cache_flush_seqno;
 };
 
 static inline struct fd2_context *

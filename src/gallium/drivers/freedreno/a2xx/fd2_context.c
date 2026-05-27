@@ -25,6 +25,9 @@ fd2_context_destroy(struct pipe_context *pctx) in_dt
    if (fd2_ctx->vsc_size_mem)
       fd_bo_del(fd2_ctx->vsc_size_mem);
 
+   if (fd2_ctx->scratch_buf)
+      pipe_resource_reference(&fd2_ctx->scratch_buf, NULL);
+
    fd_context_destroy(pctx);
    free(pctx);
 }
@@ -54,6 +57,25 @@ create_solid_vertexbuf(struct pipe_context *pctx)
                          sizeof(init_shader_const));
    pipe_buffer_write(pctx, prsc, 0, sizeof(init_shader_const),
                      init_shader_const);
+   return prsc;
+}
+
+/* Create scratch buffer for A22X cache flush timestamp verification.
+ * CACHE_FLUSH_TS writes a timestamp here when the flush completes; the
+ * following WFI then drains the pipeline. This matches the legacy KGSL
+ * pattern for explicit cache flush verification.
+ */
+static struct pipe_resource *
+create_scratch_buffer(struct pipe_context *pctx)
+{
+   static const uint32_t init_data[4] = {0, 0, 0, 0};
+
+   struct pipe_resource *prsc =
+      pipe_buffer_create(pctx->screen, PIPE_BIND_CUSTOM, PIPE_USAGE_STREAM,
+                         sizeof(init_data));
+   if (prsc)
+      pipe_buffer_write(pctx, prsc, 0, sizeof(init_data), init_data);
+
    return prsc;
 }
 
@@ -98,6 +120,10 @@ fd2_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
     */
    if (is_a22x(screen))
       fd2_ctx->vsc_size_mem = fd_bo_new(screen->dev, 0x1000, 0, "vsc_size");
+
+   /* A22X: scratch buffer for CACHE_FLUSH_TS timestamp verification */
+   if (is_a22x(screen))
+      fd2_ctx->scratch_buf = create_scratch_buffer(pctx);
 
    fd2_query_context_init(pctx);
 
