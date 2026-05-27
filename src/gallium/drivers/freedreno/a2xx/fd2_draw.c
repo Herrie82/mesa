@@ -112,8 +112,11 @@ draw_impl(struct fd_context *ctx, const struct pipe_draw_info *info,
                                               : 0); /* VGT_MIN_VTX_INDX */
    }
 
-   /* binning shader will take offset from C64 */
-   if (binning && is_a20x(ctx->screen)) {
+   /* binning shader will take offset from C64. A22X uses the same memexport
+    * binning shader (extra_position_exports reads const 64 + vtx index), so it
+    * needs this per-draw num_vertices offset too — without it the memexport
+    * addresses are stale and the visibility BOs come out empty. */
+   if (binning && (is_a20x(ctx->screen) || is_a22x(ctx->screen))) {
       OUT_PKT3(ring, CP_SET_CONSTANT, 5);
       OUT_RING(ring, 0x00000180);
       OUT_RING(ring, fui(ctx->batch->num_vertices));

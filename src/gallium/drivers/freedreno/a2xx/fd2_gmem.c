@@ -55,10 +55,17 @@ use_hw_binning(struct fd_batch *batch)
    if (gmem->num_vsc_pipes > 8 || !gmem->num_vsc_pipes)
       return false;
 
-   /* only a20x hw binning is implement
-    * a22x is more like a3xx, but perhaps the a20x works? (TODO)
+   /* a20x: shader-memexport hw binning (proven). a22x (Adreno 220): wire the
+    * SAME memexport binning pass up here too. a220 is a superset of a20x and
+    * the binning shader variant already emits the memexport visibility writes
+    * (see extra_position_exports), so this drives a real per-tile visibility
+    * pass — the freedreno "perhaps the a20x works?" TODO, finally taken.
+    * The standalone a3xx-style HW VSC unit (emit_vsc_config) needs a
+    * position-only binning shader we don't generate, so it is left OFF by
+    * default; enabling both would make them fight over the vsc_pipe BOs.
+    * FD_A22X_VSC=1 force-enables the HW VSC unit for A/B comparison instead.
     */
-   if (!is_a20x(batch->ctx->screen))
+   if (!is_a20x(batch->ctx->screen) && !is_a22x(batch->ctx->screen))
       return false;
 
    return fd_binning_enabled && ((gmem->nbins_x * gmem->nbins_y) > 2);
@@ -767,16 +774,14 @@ fd2_emit_tile_init(struct fd_batch *batch) assert_dt
       patch_draws(batch, IGNORE_VISIBILITY);
    }
 
-   /* A22X: program the always-on hardware VSC tile-binner with valid pipe
-    * state. Independent of the a20x use_hw_binning() path above — we keep
-    * plain DRAW_INDX (IGNORE_VISIBILITY) and add no binning pass; this just
-    * stops the binner corrupting tile coverage. See emit_vsc_config(). */
-   /* FD_A22X_NOVSC=1 skips programming/enabling the VSC binner, to A/B test
-    * whether the configured-but-unfed binner (LRZ_VSC_CONTROL=1 with no
-    * binning pass writing the visibility BOs) is what corrupts/wedges heavy
-    * scenes like the glmark desktop blur. */
+   /* A22X now runs a real binning pass through the a20x memexport path above
+    * (use_hw_binning). The standalone a3xx-style HW VSC unit is left disabled
+    * (LRZ_VSC_CONTROL stays 0 from emit_restore) so the two binning mechanisms
+    * can't fight over the vsc_pipe BOs. FD_A22X_VSC=1 force-enables the HW VSC
+    * unit instead, for A/B comparison — do NOT combine it with the memexport
+    * pass (it will double-write the visibility BOs). */
    if (is_a22x(ctx->screen) &&
-       !debug_get_bool_option("FD_A22X_NOVSC", false))
+       debug_get_bool_option("FD_A22X_VSC", false))
       emit_vsc_config(batch);
 
    util_dynarray_clear(&batch->draw_patches);
