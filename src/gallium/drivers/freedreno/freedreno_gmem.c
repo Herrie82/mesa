@@ -306,6 +306,24 @@ gmem_stateobj_init(struct fd_screen *screen, struct gmem_key *key)
        */
       tpp_x = 6;
       tpp_y = 6;
+   } else if (is_a22x(screen)) {
+      /* a220 hardware binner: the captured webOS/KGSL driver only ever
+       * programs VSC pipes that span at most 2 bins in X (W<=2), keeping
+       * H=1 wherever the grid fits the 8 pipes.  The generic path below
+       * instead lets a single pipe span the whole row (W = nbins_x, e.g.
+       * 3 or 4 bins).  The a220 binner mis-routes primitives for such
+       * wide pipes -> garbage auto-visibility -> tile corruption and a
+       * back-end wedge on heavy scenes (e.g. glmark desktop blur).
+       *
+       * Cap pipe width at 2 bins; only grow pipe height if a tall grid
+       * cannot otherwise be covered by the 8 hardware pipes.  With w<=2
+       * the existing A2XX_VSC_PIPE_CONFIG encoding emits exactly KGSL's
+       * words (e.g. a pipe at (0,0) with w=2 -> 0x01200000). */
+      tpp_x = 2;
+      tpp_y = 1;
+      while ((DIV_ROUND_UP(gmem->nbins_y, tpp_y) *
+              DIV_ROUND_UP(gmem->nbins_x, tpp_x)) > npipes)
+         tpp_y += 1;
    } else {
       tpp_x = tpp_y = 1;
       while (DIV_ROUND_UP(gmem->nbins_y, tpp_y) > npipes)
