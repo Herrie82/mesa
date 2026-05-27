@@ -564,6 +564,26 @@ emit_vsc_config(struct fd_batch *batch) assert_dt
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
    OUT_RING(ring, CP_REG(REG_A2XX_A220_RB_LRZ_VSC_CONTROL));
    OUT_RING(ring, 0x00000001);
+
+   /* DEBUG (FD_MESA_DEBUG=msgs): dump the emitted VSC grid so it can be diffed
+    * against the webOS hardware capture. webOS depth scene = BIN_SIZE 0x187
+    * (224x384), 5x2 bins, PIPE_CONFIG 0x01100000/0x01100001/0x01200400/...
+    * (low16 = (y<<10)|x). If freedreno's grid or CONFIG encoding differs, that
+    * mismatch is the a220 binner-wedge bug on heavy scenes (e.g. glmark blur). */
+   if (FD_DBG(MSGS)) {
+      DBG("a22x VSC: bin=%dx%d nbins=%dx%d num_vsc_pipes=%d BIN_SIZE=0x%08x",
+          gmem->bin_w, gmem->bin_h, gmem->nbins_x, gmem->nbins_y,
+          gmem->num_vsc_pipes,
+          A2XX_A220_VSC_BIN_SIZE_WIDTH(gmem->bin_w) |
+             A2XX_A220_VSC_BIN_SIZE_HEIGHT(gmem->bin_h));
+      for (int dp = 0; dp < 8; dp++) {
+         const struct fd_vsc_pipe *pp = &gmem->vsc_pipe[dp];
+         DBG("a22x VSC pipe[%d]: x=%d y=%d w=%d h=%d CONFIG=0x%08x", dp,
+             pp->x, pp->y, pp->w, pp->h,
+             A2XX_VSC_PIPE_CONFIG_X(pp->x) | A2XX_VSC_PIPE_CONFIG_Y(pp->y) |
+                A2XX_VSC_PIPE_CONFIG_W(pp->w) | A2XX_VSC_PIPE_CONFIG_H(pp->h));
+      }
+   }
 }
 
 /* before first tile */
@@ -751,7 +771,12 @@ fd2_emit_tile_init(struct fd_batch *batch) assert_dt
     * state. Independent of the a20x use_hw_binning() path above — we keep
     * plain DRAW_INDX (IGNORE_VISIBILITY) and add no binning pass; this just
     * stops the binner corrupting tile coverage. See emit_vsc_config(). */
-   if (is_a22x(ctx->screen))
+   /* FD_A22X_NOVSC=1 skips programming/enabling the VSC binner, to A/B test
+    * whether the configured-but-unfed binner (LRZ_VSC_CONTROL=1 with no
+    * binning pass writing the visibility BOs) is what corrupts/wedges heavy
+    * scenes like the glmark desktop blur. */
+   if (is_a22x(ctx->screen) &&
+       !debug_get_bool_option("FD_A22X_NOVSC", false))
       emit_vsc_config(batch);
 
    util_dynarray_clear(&batch->draw_patches);
