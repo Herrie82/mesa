@@ -254,6 +254,37 @@ calc_nbins(struct gmem_key *key, struct fd_gmem_stateobj *gmem)
    }
 
    layout_gmem(key, nbins_x, nbins_y, gmem);
+
+   /*
+    * a220: the hardware tile-binner is covered by num_vsc_pipes (8) VSC
+    * pipes, and the captured webOS/KGSL driver only ever programs pipes
+    * that span at most 2 bins in X and exactly 1 bin in Y (W<=2, H=1; see
+    * the a22x VSC pipe-width cap in gmem_stateobj_init).  Covering the grid
+    * under that rule needs:
+    *
+    *    DIV_ROUND_UP(nbins_x, 2) * nbins_y <= num_vsc_pipes
+    *
+    * Because layout_gmem() counts the depth/stencil buffer in the per-bin
+    * GMEM budget (KGSL sizes bins for color only), freedreno tends to pick
+    * short bins / tall grids for depth scenes (e.g. 3x5) that violate this
+    * and force a pipe to be >1 bin tall, which the a220 binner mis-handles
+    * (garbage visibility -> tile corruption / back-end wedge).
+    *
+    * Reshape for a22x: drop a row at a time (growing columns to keep the
+    * GMEM and tile_max_w fit) until the grid fits the 8 pipes at H=1.
+    */
+   if (is_a22x(screen)) {
+      const uint32_t npipes = screen->info->num_vsc_pipes;
+      while ((DIV_ROUND_UP(nbins_x, 2) * nbins_y) > npipes && nbins_y > 1) {
+         nbins_y--;
+         /* taller bins now: grow columns until they fit GMEM + tile_max_w */
+         while ((div_align(key->width, nbins_x, screen->info->tile_align_w) >
+                 max_width) ||
+                !layout_gmem(key, nbins_x, nbins_y, gmem))
+            nbins_x++;
+      }
+      layout_gmem(key, nbins_x, nbins_y, gmem);
+   }
 }
 
 static struct fd_gmem_stateobj *
