@@ -6,6 +6,8 @@
  *    Rob Clark <robclark@freedesktop.org>
  */
 
+#include <inttypes.h>
+
 #include "pipe/p_state.h"
 #include "util/u_helpers.h"
 #include "util/u_memory.h"
@@ -385,33 +387,37 @@ fd2_emit_state(struct fd_context *ctx, const enum fd_dirty_3d_state dirty)
 }
 
 /* ------------------------------------------------------------------
- * fd2_emit_cycprobe(ring, idx) -- emit a CP_REG_TO_MEM that copies
- * the GPU CYCLECTR (a2xx reg 0x0ee2, the GPU cycle counter that KGSL
- * diag also reads) into ctx->scratch_buf at byte offset (idx*4).
+ * CYCLECTR (a2xx GPU cycle counter, reg 0x0ee2) per-region probes.
  *
- * Gated by env FD_CYCPROF=1; no-op otherwise. Used for per-region GPU
- * cycle timing: insert probes at known cmdstream points, after fence,
- * read scratch_buf and compute deltas.
+ * Gated by env FD_CYCPROF=1; no-op otherwise. Inserts CP_REG_TO_MEM
+ * packets that copy the cycle counter into fd2_context::scratch_buf
+ * at known offsets. fd2_cycprobe_dump() reads the previous batch's
+ * results back (with fd_bo_cpu_prep WAIT for fence completion) and
+ * prints per-tile delta cycle counts.
  *
- * Probe locations to be added next session (see next-steps handoff):
- *   - fd2_emit_tile_init start (batch begin)
- *   - per-tile start / after mem2gmem / after batch->draw / after gmem2mem
- *   - fd2_emit_tile_fini end (batch end)
- *
- * For now this is infrastructure only. Caller passes a unique idx per
- * probe site; scratch_buf is sized in fd2_context_create for up to ~128
- * probes (512 bytes).
+ * Probe slot layout in scratch_buf (uint32 array, 128 slots / 512 B):
+ *   slot 0                  = batch start (after restore/prologue)
+ *   slot 1+tile*3+0         = tile draws-start (end of renderprep)
+ *   slot 1+tile*3+1         = tile draws-end / resolve-start
+ *   slot 1+tile*3+2         = tile resolve-end
+ * Total used per batch = 1 + 3*nbins (max 49 for 16-bin scenes).
  * ------------------------------------------------------------------ */
-void
-fd2_emit_cycprobe(struct fd_context *ctx, struct fd_ringbuffer *ring,
-                  unsigned idx)
+bool
+fd2_cycprobe_active(void)
 {
    static int cached = -1;
    if (cached < 0) {
       const char *e = getenv("FD_CYCPROF");
       cached = (e && atoi(e)) ? 1 : 0;
    }
-   if (!cached)
+   return cached != 0;
+}
+
+void
+fd2_emit_cycprobe(struct fd_context *ctx, struct fd_ringbuffer *ring,
+                  unsigned idx)
+{
+   if (!fd2_cycprobe_active())
       return;
 
    struct fd2_context *fd2_ctx = fd2_context(ctx);
@@ -423,9 +429,50 @@ fd2_emit_cycprobe(struct fd_context *ctx, struct fd_ringbuffer *ring,
     *   payload[0] = reg address
     *   payload[1] = memory address (via OUT_RELOC). */
    OUT_PKT3(ring, CP_REG_TO_MEM, 2);
-   OUT_RING(ring, 0x0ee2);  /* CYCLECTR (a2xx GPU cycle counter; same reg
-                             * KGSL diag dumps as CYCLECTR[0x0ee2]) */
+   OUT_RING(ring, 0x0ee2);  /* CYCLECTR (same reg KGSL diag dumps) */
    OUT_RELOC(ring, bo, idx * 4, 0, 0);
+}
+
+/* Dump previous batch's probes (waits on BO for GPU completion).
+ * Called from fd2_emit_tile_init BEFORE emitting new probes that would
+ * overwrite scratch_buf. No-op when FD_CYCPROF is unset, no previous
+ * batch had probes, or scratch_buf is missing.
+ */
+void
+fd2_cycprobe_dump(struct fd_context *ctx)
+{
+   if (!fd2_cycprobe_active())
+      return;
+
+   struct fd2_context *fd2_ctx = fd2_context(ctx);
+   if (!fd2_ctx->scratch_buf || fd2_ctx->cycprobe_nbins == 0)
+      return;
+   uint32_t nbins = fd2_ctx->cycprobe_nbins;
+   fd2_ctx->cycprobe_nbins = 0;
+
+   struct fd_bo *bo = fd_resource(fd2_ctx->scratch_buf)->bo;
+   fd_bo_cpu_prep(bo, ctx->pipe, FD_BO_PREP_READ);
+   uint32_t *vals = fd_bo_map(bo);
+
+   fprintf(stderr, "CYCPROBE %u tiles  start=%u\n", nbins, vals[0]);
+   uint64_t total_draws = 0, total_resolve = 0;
+   for (uint32_t t = 0; t < nbins; t++) {
+      uint32_t t_start = vals[1 + t * 3 + 0];
+      uint32_t t_de   = vals[1 + t * 3 + 1];
+      uint32_t t_re   = vals[1 + t * 3 + 2];
+      uint32_t draws_cyc   = t_de - t_start;
+      uint32_t resolve_cyc = t_re - t_de;
+      total_draws   += draws_cyc;
+      total_resolve += resolve_cyc;
+      fprintf(stderr,
+              "  tile %2u: draws=%-8u resolve=%-8u  (s=%u de=%u re=%u)\n",
+              t, draws_cyc, resolve_cyc, t_start, t_de, t_re);
+   }
+   fprintf(stderr,
+           "CYCPROBE totals: draws=%" PRIu64 " resolve=%" PRIu64
+           "  avg/tile: draws=%" PRIu64 " resolve=%" PRIu64 "\n",
+           total_draws, total_resolve,
+           total_draws / nbins, total_resolve / nbins);
 }
 
 /* emit per-context initialization:

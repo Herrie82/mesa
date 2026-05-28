@@ -30,9 +30,13 @@ void fd2_emit_restore(struct fd_context *ctx, struct fd_ringbuffer *ring);
 
 /* CYCLECTR perfcounter probe (env FD_CYCPROF=1 to enable; no-op otherwise).
  * Writes the GPU cycle counter (reg 0x0ee2) into fd2_context::scratch_buf
- * at byte offset (idx*4). See fd2_emit.c for usage notes. */
+ * at byte offset (idx*4). See fd2_emit.c for slot layout. */
+bool fd2_cycprobe_active(void);
 void fd2_emit_cycprobe(struct fd_context *ctx, struct fd_ringbuffer *ring,
                        unsigned idx);
+/* Dump previous batch's probes (waits on the BO's fence). Called from
+ * fd2_emit_tile_init BEFORE the new batch overwrites scratch_buf. */
+void fd2_cycprobe_dump(struct fd_context *ctx);
 
 void fd2_emit_init_screen(struct pipe_screen *pscreen);
 void fd2_emit_init(struct pipe_context *pctx);

@@ -237,7 +237,16 @@ prepare_tile_fini_ib(struct fd_batch *batch) assert_dt
 static void
 fd2_emit_tile_gmem2mem(struct fd_batch *batch, const struct fd_tile *tile)
 {
+   struct fd_context *ctx = batch->ctx;
+
+   /* FD_CYCPROF=1: probe (1 + tile*3 + 1) = end of tile draws / start of
+    * resolve. tile->n is the linear tile index. */
+   fd2_emit_cycprobe(ctx, batch->gmem, 1 + tile->n * 3 + 1);
+
    fd2_emit_ib(batch->gmem, batch->tile_store);
+
+   /* probe (1 + tile*3 + 2) = end of resolve. */
+   fd2_emit_cycprobe(ctx, batch->gmem, 1 + tile->n * 3 + 2);
 }
 
 /* transfer from system memory to gmem */
@@ -618,9 +627,19 @@ fd2_emit_tile_init(struct fd_batch *batch) assert_dt
    enum pipe_format format = pipe_surface_format(&pfb->cbufs[0]);
    uint32_t reg;
 
+   /* FD_CYCPROF=1: dump previous batch's CYCLECTR probes before scratch_buf
+    * gets overwritten by the new batch's probes below. */
+   fd2_cycprobe_dump(ctx);
+
    fd2_emit_restore(ctx, ring);
 
    prepare_tile_fini_ib(batch);
+
+   /* FD_CYCPROF=1: probe 0 = batch start (after restore/setup, before tile loop).
+    * Record nbins so the dump (next batch) knows how many tile slots to read. */
+   fd2_emit_cycprobe(ctx, ring, 0);
+   if (fd2_cycprobe_active())
+      fd2_context(ctx)->cycprobe_nbins = gmem->nbins_x * gmem->nbins_y;
 
    OUT_PKT3(ring, CP_SET_CONSTANT, 4);
    OUT_RING(ring, CP_REG(REG_A2XX_RB_SURFACE_INFO));
@@ -906,6 +925,11 @@ fd2_emit_tile_renderprep(struct fd_batch *batch,
       OUT_PKT3(ring, CP_SET_DRAW_INIT_FLAGS, 1);
       OUT_RELOC(ring, pipe_bo, 0, 0, 0);
    }
+
+   /* FD_CYCPROF=1: probe (1 + tile*3 + 0) = end of renderprep / start of
+    * the per-tile batch->draw replay. Pair with the 1+tile*3+1 / +2 probes
+    * in fd2_emit_tile_gmem2mem to get per-tile draws and resolve cycles. */
+   fd2_emit_cycprobe(ctx, ring, 1 + tile->n * 3 + 0);
 }
 
 void
