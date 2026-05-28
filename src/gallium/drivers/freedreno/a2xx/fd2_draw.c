@@ -30,17 +30,25 @@ pack_rgba(enum pipe_format format, const float *rgba)
 }
 
 static void
-emit_cacheflush(struct fd_ringbuffer *ring)
+emit_cacheflush(struct fd_context *ctx, struct fd_ringbuffer *ring)
 {
+   /* A22X: skip the per-draw cache flush entirely. The strong drain
+    * (CACHE_FLUSH_TS + WFI) that the resolve race actually needs is emitted
+    * ONCE PER TILE in prepare_tile_fini_ib (0018), and EDRAM (the framebuffer
+    * cache) is naturally coherent within a tile across draws.
+    *
+    * Measured 2026-05-28: per-draw 12x CACHE_FLUSH was producing 294
+    * CP_EVENT_WRITE per frame on A22X (legacy KGSL emits ~11/frame for the
+    * SAME workload, a 27x bloat) and contributing to the 5.5x freedreno-vs-KGSL
+    * blur perf gap on the same Adreno 220 hardware (binner_test heavy:
+    * KGSL 5.45 fps vs freedreno 0.99 fps).
+    *
+    * A20X keeps the original 12x async CACHE_FLUSH (no per-tile drain there,
+    * the legacy behaviour is the proven correctness for that GPU). */
+   if (is_a22x(ctx->screen))
+      return;
+
    unsigned i;
-   /* Light async cache flush per draw (no pipeline drain) on BOTH a20x and
-    * a22x. The STRONG CACHE_FLUSH_TS+WFI that serialises a tile's draws
-    * against its gmem2mem resolve is emitted ONCE PER TILE in
-    * prepare_tile_fini_ib (a22x), not per draw. Draining the whole pipeline
-    * per draw (the original A22X fix) was correct but crippled heavy
-    * multi-bin scenes: draws x 16 tiles full pipeline stalls -> ~1 fps. The
-    * resolve race only needs the draws drained before the resolve READS
-    * gmem, which is a per-tile boundary, not a per-draw one. */
    for (i = 0; i < 12; i++) {
       OUT_PKT3(ring, CP_EVENT_WRITE, 1);
       OUT_RING(ring, CACHE_FLUSH);
@@ -148,7 +156,7 @@ draw_impl(struct fd_context *ctx, const struct pipe_draw_info *info,
       OUT_RING(ring, 0x00000000);
    }
 
-   emit_cacheflush(ring);
+   emit_cacheflush(ctx, ring);
 }
 
 static bool
