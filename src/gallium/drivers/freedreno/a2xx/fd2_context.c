@@ -60,21 +60,23 @@ create_solid_vertexbuf(struct pipe_context *pctx)
    return prsc;
 }
 
-/* Create scratch buffer for A22X cache flush timestamp verification.
- * CACHE_FLUSH_TS writes a timestamp here when the flush completes; the
- * following WFI then drains the pipeline. This matches the legacy KGSL
- * pattern for explicit cache flush verification.
+/* Create scratch buffer for A22X cache flush timestamp verification AND
+ * CYCLECTR perfcounter probes (fd2_emit_cycprobe). The cache-flush use
+ * only needs the first 4 bytes; the rest provides up to ~128 cycprobe
+ * slots (FD_CYCPROF=1, env-gated, off by default so this is dead memory
+ * in normal runs). 512 bytes is one cache line worth and trivial cost.
  */
+#define FD2_SCRATCH_BUF_BYTES 512
 static struct pipe_resource *
 create_scratch_buffer(struct pipe_context *pctx)
 {
-   static const uint32_t init_data[4] = {0, 0, 0, 0};
+   static const uint32_t init_data[FD2_SCRATCH_BUF_BYTES / 4] = {0};
 
    struct pipe_resource *prsc =
       pipe_buffer_create(pctx->screen, PIPE_BIND_CUSTOM, PIPE_USAGE_STREAM,
-                         sizeof(init_data));
+                         FD2_SCRATCH_BUF_BYTES);
    if (prsc)
-      pipe_buffer_write(pctx, prsc, 0, sizeof(init_data), init_data);
+      pipe_buffer_write(pctx, prsc, 0, FD2_SCRATCH_BUF_BYTES, init_data);
 
    return prsc;
 }

@@ -28,6 +28,12 @@ void fd2_emit_state(struct fd_context *ctx,
                     const enum fd_dirty_3d_state dirty) assert_dt;
 void fd2_emit_restore(struct fd_context *ctx, struct fd_ringbuffer *ring);
 
+/* CYCLECTR perfcounter probe (env FD_CYCPROF=1 to enable; no-op otherwise).
+ * Writes the GPU cycle counter (reg 0x0ee2) into fd2_context::scratch_buf
+ * at byte offset (idx*4). See fd2_emit.c for usage notes. */
+void fd2_emit_cycprobe(struct fd_context *ctx, struct fd_ringbuffer *ring,
+                       unsigned idx);
+
 void fd2_emit_init_screen(struct pipe_screen *pscreen);
 void fd2_emit_init(struct pipe_context *pctx);
 

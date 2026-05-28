@@ -384,6 +384,50 @@ fd2_emit_state(struct fd_context *ctx, const enum fd_dirty_3d_state dirty)
       emit_textures(ring, ctx);
 }
 
+/* ------------------------------------------------------------------
+ * fd2_emit_cycprobe(ring, idx) -- emit a CP_REG_TO_MEM that copies
+ * the GPU CYCLECTR (a2xx reg 0x0ee2, the GPU cycle counter that KGSL
+ * diag also reads) into ctx->scratch_buf at byte offset (idx*4).
+ *
+ * Gated by env FD_CYCPROF=1; no-op otherwise. Used for per-region GPU
+ * cycle timing: insert probes at known cmdstream points, after fence,
+ * read scratch_buf and compute deltas.
+ *
+ * Probe locations to be added next session (see next-steps handoff):
+ *   - fd2_emit_tile_init start (batch begin)
+ *   - per-tile start / after mem2gmem / after batch->draw / after gmem2mem
+ *   - fd2_emit_tile_fini end (batch end)
+ *
+ * For now this is infrastructure only. Caller passes a unique idx per
+ * probe site; scratch_buf is sized in fd2_context_create for up to ~128
+ * probes (512 bytes).
+ * ------------------------------------------------------------------ */
+void
+fd2_emit_cycprobe(struct fd_context *ctx, struct fd_ringbuffer *ring,
+                  unsigned idx)
+{
+   static int cached = -1;
+   if (cached < 0) {
+      const char *e = getenv("FD_CYCPROF");
+      cached = (e && atoi(e)) ? 1 : 0;
+   }
+   if (!cached)
+      return;
+
+   struct fd2_context *fd2_ctx = fd2_context(ctx);
+   if (!fd2_ctx->scratch_buf)
+      return;
+   struct fd_bo *bo = fd_resource(fd2_ctx->scratch_buf)->bo;
+
+   /* CP_REG_TO_MEM 0x3e: reads register, writes to memory.
+    *   payload[0] = reg address
+    *   payload[1] = memory address (via OUT_RELOC). */
+   OUT_PKT3(ring, CP_REG_TO_MEM, 2);
+   OUT_RING(ring, 0x0ee2);  /* CYCLECTR (a2xx GPU cycle counter; same reg
+                             * KGSL diag dumps as CYCLECTR[0x0ee2]) */
+   OUT_RELOC(ring, bo, idx * 4, 0, 0);
+}
+
 /* emit per-context initialization:
  */
 void
