@@ -239,14 +239,18 @@ fd2_emit_tile_gmem2mem(struct fd_batch *batch, const struct fd_tile *tile)
 {
    struct fd_context *ctx = batch->ctx;
 
-   /* FD_CYCPROF=1: probe (1 + tile*3 + 1) = end of tile draws / start of
-    * resolve. tile->n is the linear tile index. */
-   fd2_emit_cycprobe(ctx, batch->gmem, 1 + tile->n * 3 + 1);
+   /* FD_CYCPROF=1: probe (1 + tidx*3 + 1) = end of tile draws / start of
+    * resolve. tile->n is "slot within VSC pipe" (0..1 on A22X's 2-pipe
+    * config), NOT the global tile index -- use (tile - gmem->tile) for
+    * the actual linear index across all pipes. */
+   const struct fd_gmem_stateobj *gmem = batch->gmem_state;
+   unsigned tidx = tile - gmem->tile;
+   fd2_emit_cycprobe(ctx, batch->gmem, 1 + tidx * 3 + 1);
 
    fd2_emit_ib(batch->gmem, batch->tile_store);
 
-   /* probe (1 + tile*3 + 2) = end of resolve. */
-   fd2_emit_cycprobe(ctx, batch->gmem, 1 + tile->n * 3 + 2);
+   /* probe (1 + tidx*3 + 2) = end of resolve. */
+   fd2_emit_cycprobe(ctx, batch->gmem, 1 + tidx * 3 + 2);
 }
 
 /* transfer from system memory to gmem */
@@ -926,10 +930,14 @@ fd2_emit_tile_renderprep(struct fd_batch *batch,
       OUT_RELOC(ring, pipe_bo, 0, 0, 0);
    }
 
-   /* FD_CYCPROF=1: probe (1 + tile*3 + 0) = end of renderprep / start of
-    * the per-tile batch->draw replay. Pair with the 1+tile*3+1 / +2 probes
-    * in fd2_emit_tile_gmem2mem to get per-tile draws and resolve cycles. */
-   fd2_emit_cycprobe(ctx, ring, 1 + tile->n * 3 + 0);
+   /* FD_CYCPROF=1: probe (1 + tidx*3 + 0) = end of renderprep / start of
+    * the per-tile batch->draw replay. tile->n is slot-within-pipe, not
+    * the global tile index -- compute the global index from gmem->tile. */
+   {
+      const struct fd_gmem_stateobj *gmem = batch->gmem_state;
+      unsigned tidx = tile - gmem->tile;
+      fd2_emit_cycprobe(ctx, ring, 1 + tidx * 3 + 0);
+   }
 }
 
 void
