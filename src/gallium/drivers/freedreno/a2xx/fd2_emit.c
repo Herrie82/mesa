@@ -221,7 +221,27 @@ fd2_emit_state(struct fd_context *ctx, const enum fd_dirty_3d_state dirty)
    struct fd2_blend_stateobj *blend = fd2_blend_stateobj(ctx->blend);
    struct fd2_zsa_stateobj *zsa = fd2_zsa_stateobj(ctx->zsa);
    struct fd2_shader_stateobj *fs = ctx->prog.fs;
-   struct fd_ringbuffer *ring = ctx->batch->draw;
+
+   /* HOIST per-batch-invariant state to batch->prologue on the FIRST
+    * fd2_emit_state() call per batch (when ALL flags are dirty -> emit
+    * everything). The prologue runs ONCE per batch from fd2_emit_tile_init
+    * / fd2_emit_sysmem_prep; batch->draw is replayed PER TILE by
+    * render_tiles, so without this hoist the FIRST-draw state (shaders
+    * IM_LOAD, blend, depth, viewport, textures...) re-executes nbins times
+    * per batch (16x on heavy scenes). Subsequent fd2_emit_state() calls in
+    * this batch only have CHANGED state dirty, and go to batch->draw as
+    * normal -- those represent real per-draw state transitions.
+    *
+    * Cmdstream comparison vs legacy KGSL (2026-05-28): freedreno emits
+    * ~1.5x state writes per frame on the same workload, dominated by this
+    * per-tile replay of the first-draw state. KGSL emits invariant state
+    * in a per-batch header. */
+   struct fd_ringbuffer *ring;
+   if (ctx->batch->prologue == NULL) {
+      ring = fd_batch_get_prologue(ctx->batch);
+   } else {
+      ring = ctx->batch->draw;
+   }
 
    /* NOTE: we probably want to eventually refactor this so each state
     * object handles emitting it's own state..  although the mapping of

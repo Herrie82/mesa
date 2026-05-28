@@ -479,6 +479,12 @@ fd2_emit_sysmem_prep(struct fd_batch *batch)
 
    fd2_emit_restore(ctx, ring);
 
+   /* Per-batch prologue (same as the GMEM path): invariant state hoisted by
+    * fd2_emit_state() on the first draw. Must run here too because sysmem
+    * batches never go through fd2_emit_tile_init. */
+   if (batch->prologue)
+      fd2_emit_ib(ring, batch->prologue);
+
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
    OUT_RING(ring, CP_REG(REG_A2XX_RB_SURFACE_INFO));
    OUT_RING(ring, A2XX_RB_SURFACE_INFO_SURFACE_PITCH(pitch));
@@ -619,6 +625,13 @@ fd2_emit_tile_init(struct fd_batch *batch) assert_dt
    uint32_t reg;
 
    fd2_emit_restore(ctx, ring);
+
+   /* Per-batch prologue: invariant state hoisted by fd2_emit_state() on the
+    * first draw of the batch (shaders, blend/depth/raster, viewport,
+    * textures). Runs ONCE here in batch->gmem instead of being replayed
+    * inside batch->draw nbins times. See fd2_emit.c:fd2_emit_state(). */
+   if (batch->prologue)
+      fd2_emit_ib(ring, batch->prologue);
 
    prepare_tile_fini_ib(batch);
 
