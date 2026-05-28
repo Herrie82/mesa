@@ -395,13 +395,26 @@ fd2_emit_state(struct fd_context *ctx, const enum fd_dirty_3d_state dirty)
  * results back (with fd_bo_cpu_prep WAIT for fence completion) and
  * prints per-tile delta cycle counts.
  *
- * Probe slot layout in scratch_buf (uint32 array, 128 slots / 512 B):
- *   slot 0                  = batch start (after restore/prologue)
- *   slot 1+tile*3+0         = tile draws-start (end of renderprep)
- *   slot 1+tile*3+1         = tile draws-end / resolve-start
- *   slot 1+tile*3+2         = tile resolve-end
- * Total used per batch = 1 + 3*nbins (max 49 for 16-bin scenes).
+ * scratch_buf layout (512 B total, uint32 indexing):
+ *   [0]                          CACHE_FLUSH_TS timestamp (used by
+ *                                fd2_gmem prepare_tile_fini_ib) -- DO NOT
+ *                                use for cycprobes.
+ *   [FD2_CYC_BASE + 0]           batch start (after restore/prologue)
+ *   [FD2_CYC_BASE + 1+t*3 + 0]   tile draws-start (end of renderprep)
+ *   [FD2_CYC_BASE + 1+t*3 + 1]   tile draws-end / resolve-start
+ *   [FD2_CYC_BASE + 1+t*3 + 2]   tile resolve-end
+ * Total used per batch = 1 + 3*nbins (max 49 for 16-bin scenes), starting
+ * at slot 4 -> max slot 52 -> max byte offset 208. Well below 512 B.
+ *
+ * Each probe inserts an OUT_WFI BEFORE the CP_REG_TO_MEM so the cycle
+ * counter is sampled AFTER the preceding GPU work has drained. Without
+ * the WFI the CP races ahead of the 3D engine, producing out-of-order
+ * timestamps (CACHE_FLUSH_TS+WFI for the gmem2mem boundary already runs
+ * inside the resolve IB but isn't on the path between probe-N and the
+ * draws that follow it). The WFI is what makes the delta meaningful.
  * ------------------------------------------------------------------ */
+#define FD2_CYC_BASE 4  /* uint32 slots; byte offset = 16 */
+
 bool
 fd2_cycprobe_active(void)
 {
@@ -425,12 +438,17 @@ fd2_emit_cycprobe(struct fd_context *ctx, struct fd_ringbuffer *ring,
       return;
    struct fd_bo *bo = fd_resource(fd2_ctx->scratch_buf)->bo;
 
+   /* Drain the GPU pipeline so the cycle counter sample is taken AFTER
+    * the preceding work has fully completed (otherwise the CP samples
+    * ahead of the 3D engine and produces out-of-order timestamps). */
+   OUT_WFI(ring);
+
    /* CP_REG_TO_MEM 0x3e: reads register, writes to memory.
-    *   payload[0] = reg address
+    *   payload[0] = reg address (low 18 bits = REG)
     *   payload[1] = memory address (via OUT_RELOC). */
    OUT_PKT3(ring, CP_REG_TO_MEM, 2);
-   OUT_RING(ring, 0x0ee2);  /* CYCLECTR (same reg KGSL diag dumps) */
-   OUT_RELOC(ring, bo, idx * 4, 0, 0);
+   OUT_RING(ring, 0x0ee2);  /* CYCLECTR (DIAG_REG_CYCLECTR in KGSL) */
+   OUT_RELOC(ring, bo, (FD2_CYC_BASE + idx) * 4, 0, 0);
 }
 
 /* Dump previous batch's probes (waits on BO for GPU completion).
@@ -452,7 +470,8 @@ fd2_cycprobe_dump(struct fd_context *ctx)
 
    struct fd_bo *bo = fd_resource(fd2_ctx->scratch_buf)->bo;
    fd_bo_cpu_prep(bo, ctx->pipe, FD_BO_PREP_READ);
-   uint32_t *vals = fd_bo_map(bo);
+   uint32_t *raw = fd_bo_map(bo);
+   uint32_t *vals = raw + FD2_CYC_BASE;  /* skip CACHE_FLUSH_TS dword */
 
    fprintf(stderr, "CYCPROBE %u tiles  start=%u\n", nbins, vals[0]);
    uint64_t total_draws = 0, total_resolve = 0;
