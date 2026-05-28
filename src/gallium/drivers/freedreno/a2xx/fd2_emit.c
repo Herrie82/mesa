@@ -387,33 +387,34 @@ fd2_emit_state(struct fd_context *ctx, const enum fd_dirty_3d_state dirty)
 }
 
 /* ------------------------------------------------------------------
- * CYCLECTR (a2xx GPU cycle counter, reg 0x0ee2) per-region probes.
+ * GPU-side timestamp per-region probes via CACHE_FLUSH_TS | TIMESTAMP.
  *
- * Gated by env FD_CYCPROF=1; no-op otherwise. Inserts CP_REG_TO_MEM
- * packets that copy the cycle counter into fd2_context::scratch_buf
- * at known offsets. fd2_cycprobe_dump() reads the previous batch's
- * results back (with fd_bo_cpu_prep WAIT for fence completion) and
- * prints per-tile delta cycle counts.
+ * Gated by env FD_CYCPROF=1; no-op otherwise. Emits CP_EVENT_WRITE with
+ * the CACHE_FLUSH_TS event and the TIMESTAMP flag set: this tells the
+ * GPU to drain its cache and write its HARDWARE TIMESTAMP (not the
+ * user-supplied seqno value) to the destination address. The hardware
+ * timestamp is the same monotonic counter the GPU uses for fences --
+ * a real GPU-side clock, unlike CYCLECTR (reg 0x0ee2) which is not
+ * cleanly readable via CP_REG_TO_MEM on a2xx.
  *
- * scratch_buf layout (512 B total, uint32 indexing):
- *   [0]                          CACHE_FLUSH_TS timestamp (used by
- *                                fd2_gmem prepare_tile_fini_ib) -- DO NOT
- *                                use for cycprobes.
- *   [FD2_CYC_BASE + 0]           batch start (after restore/prologue)
- *   [FD2_CYC_BASE + 1+t*3 + 0]   tile draws-start (end of renderprep)
- *   [FD2_CYC_BASE + 1+t*3 + 1]   tile draws-end / resolve-start
- *   [FD2_CYC_BASE + 1+t*3 + 2]   tile resolve-end
- * Total used per batch = 1 + 3*nbins (max 49 for 16-bin scenes), starting
- * at slot 4 -> max slot 52 -> max byte offset 208. Well below 512 B.
+ * Each probe is 8 bytes (64-bit timestamp). scratch_buf layout
+ * (512 B total, uint32 indexing):
+ *   [0]                              CACHE_FLUSH_TS seqno (used by
+ *                                    prepare_tile_fini_ib) -- DO NOT touch.
+ *   [FD2_TS_BASE + 0..1]             batch start (after restore/prologue)
+ *   [FD2_TS_BASE + 2 + t*6 + 0..1]   tile draws-start (end of renderprep)
+ *   [FD2_TS_BASE + 2 + t*6 + 2..3]   tile draws-end / resolve-start
+ *   [FD2_TS_BASE + 2 + t*6 + 4..5]   tile resolve-end
+ * Total uint32 slots used per batch = 2 + 6*nbins. For 16 bins = 98 slots
+ * = 392 bytes after FD2_TS_BASE (which is at byte 16). Total used max
+ * = 16 + 392 = 408 bytes. Under the 512-byte scratch_buf.
  *
- * Each probe inserts an OUT_WFI BEFORE the CP_REG_TO_MEM so the cycle
- * counter is sampled AFTER the preceding GPU work has drained. Without
- * the WFI the CP races ahead of the 3D engine, producing out-of-order
- * timestamps (CACHE_FLUSH_TS+WFI for the gmem2mem boundary already runs
- * inside the resolve IB but isn't on the path between probe-N and the
- * draws that follow it). The WFI is what makes the delta meaningful.
+ * CACHE_FLUSH_TS drains the pipeline naturally, so no separate WFI is
+ * needed -- the timestamp is sampled AFTER the preceding work completes.
+ * The two consecutive timestamps that bracket a region therefore give a
+ * real GPU wall-clock delta for that region.
  * ------------------------------------------------------------------ */
-#define FD2_CYC_BASE 4  /* uint32 slots; byte offset = 16 */
+#define FD2_TS_BASE 4  /* uint32 slots; byte offset = 16 */
 
 bool
 fd2_cycprobe_active(void)
@@ -438,17 +439,17 @@ fd2_emit_cycprobe(struct fd_context *ctx, struct fd_ringbuffer *ring,
       return;
    struct fd_bo *bo = fd_resource(fd2_ctx->scratch_buf)->bo;
 
-   /* Drain the GPU pipeline so the cycle counter sample is taken AFTER
-    * the preceding work has fully completed (otherwise the CP samples
-    * ahead of the 3D engine and produces out-of-order timestamps). */
-   OUT_WFI(ring);
-
-   /* CP_REG_TO_MEM 0x3e: reads register, writes to memory.
-    *   payload[0] = reg address (low 18 bits = REG)
-    *   payload[1] = memory address (via OUT_RELOC). */
-   OUT_PKT3(ring, CP_REG_TO_MEM, 2);
-   OUT_RING(ring, 0x0ee2);  /* CYCLECTR (DIAG_REG_CYCLECTR in KGSL) */
-   OUT_RELOC(ring, bo, (FD2_CYC_BASE + idx) * 4, 0, 0);
+   /* CP_EVENT_WRITE for CACHE_FLUSH_TS with the TIMESTAMP flag: GPU
+    * drains its cache and writes its hardware timestamp (64-bit) to
+    * the destination address. The third dword is the seqno value used
+    * when TIMESTAMP is NOT set -- with TIMESTAMP set the GPU writes
+    * its own timestamp and this dword is ignored. */
+   OUT_PKT3(ring, CP_EVENT_WRITE, 3);
+   OUT_RING(ring, CACHE_FLUSH_TS | CP_EVENT_WRITE_0_TIMESTAMP);
+   /* Byte offset within scratch_buf: 16 + idx*8.  Each probe occupies
+    * 2 uint32 slots (8 bytes) for the 64-bit timestamp. */
+   OUT_RELOC(ring, bo, (FD2_TS_BASE * 4) + idx * 8, 0, 0);
+   OUT_RING(ring, 0);  /* ignored when TIMESTAMP flag is set */
 }
 
 /* Dump previous batch's probes (waits on BO for GPU completion).
@@ -471,21 +472,29 @@ fd2_cycprobe_dump(struct fd_context *ctx)
    struct fd_bo *bo = fd_resource(fd2_ctx->scratch_buf)->bo;
    fd_bo_cpu_prep(bo, ctx->pipe, FD_BO_PREP_READ);
    uint32_t *raw = fd_bo_map(bo);
-   uint32_t *vals = raw + FD2_CYC_BASE;  /* skip CACHE_FLUSH_TS dword */
+   /* Each probe is a 64-bit timestamp. vals[2*idx] = lo, vals[2*idx+1] = hi.
+    * Start of probe area is at uint32 slot FD2_TS_BASE. */
+   uint64_t *ts = (uint64_t *)(raw + FD2_TS_BASE);
 
-   fprintf(stderr, "CYCPROBE %u tiles  start=%u\n", nbins, vals[0]);
+   uint64_t ts_batch_start = ts[0];
+   fprintf(stderr, "CYCPROBE %u tiles  batch_start=%" PRIu64 "\n",
+           nbins, ts_batch_start);
    uint64_t total_draws = 0, total_resolve = 0;
+   uint64_t prev_re = ts_batch_start;
    for (uint32_t t = 0; t < nbins; t++) {
-      uint32_t t_start = vals[1 + t * 3 + 0];
-      uint32_t t_de   = vals[1 + t * 3 + 1];
-      uint32_t t_re   = vals[1 + t * 3 + 2];
-      uint32_t draws_cyc   = t_de - t_start;
-      uint32_t resolve_cyc = t_re - t_de;
-      total_draws   += draws_cyc;
-      total_resolve += resolve_cyc;
+      uint64_t t_s  = ts[1 + t * 3 + 0];
+      uint64_t t_de = ts[1 + t * 3 + 1];
+      uint64_t t_re = ts[1 + t * 3 + 2];
+      uint64_t draws   = t_de - t_s;
+      uint64_t resolve = t_re - t_de;
+      uint64_t setup   = t_s - prev_re;  /* time since prev tile's resolve */
+      total_draws   += draws;
+      total_resolve += resolve;
       fprintf(stderr,
-              "  tile %2u: draws=%-8u resolve=%-8u  (s=%u de=%u re=%u)\n",
-              t, draws_cyc, resolve_cyc, t_start, t_de, t_re);
+              "  tile %2u: setup=%-8" PRIu64 " draws=%-8" PRIu64
+              " resolve=%-8" PRIu64 "\n",
+              t, setup, draws, resolve);
+      prev_re = t_re;
    }
    fprintf(stderr,
            "CYCPROBE totals: draws=%" PRIu64 " resolve=%" PRIu64
