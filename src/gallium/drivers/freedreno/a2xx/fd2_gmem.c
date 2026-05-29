@@ -189,24 +189,27 @@ prepare_tile_fini_ib(struct fd_batch *batch) assert_dt
    OUT_RING(ring, fui((float)gmem->bin_h / 2.0f)); /* YSCALE */
    OUT_RING(ring, fui((float)gmem->bin_h / 2.0f)); /* YOFFSET */
 
-   /* A22X: STRONG drain before the EDRAM_COPY resolve. The tile's draws must
-    * have fully landed in GMEM before the resolve reads it back; a plain
-    * OUT_WFI is insufficient on A220 (it does not wait for VGT DMA). Use
-    * CACHE_FLUSH_TS + WFI, ONCE per tile here -- this is the per-tile
-    * boundary that the resolve race actually needs, and it REPLACES the
-    * per-draw drain (which serialised every draw and crippled heavy
-    * multi-bin scenes to ~1 fps). The mode transition COLOR_DEPTH<->EDRAM_COPY
-    * also needs this sync. (This IB is built once and replayed per tile, so
-    * the flush runs once per tile, draining that tile's draws.) */
+   /* A22X: per-tile drain before the EDRAM_COPY resolve, using the LEGACY
+    * KGSL pattern -- plain CACHE_FLUSH event followed by WAIT_REG_EQ on
+    * RBBM_DEBUG (0x39b) bit 24. RBBM_DEBUG is a vendor opaque DEBUG
+    * register; KGSL captures consistently show bit 24 used as the
+    * cache-flush+EDRAM-coherency completion bit. The CACHE_FLUSH_TS + WFI
+    * pattern this replaces is in theory stronger but in practice does NOT
+    * prevent the heavy-blur EDRAM-back-end pipeline deadlock
+    * (RBBM_STATUS=0xc4010310 with GUI+RB+VGT+CP_NRT all busy); the KGSL
+    * pattern works on the same hardware for the same scene. See
+    * memory/reference_kgsl_vs_freedreno_heavy_scene and
+    * memory/project_a220_blur_hang_cmdstream_analysis for the analysis
+    * that points at bit 24 of RBBM_DEBUG specifically. */
    if (!is_a20x(ctx->screen)) {
-      if (fd2_ctx->scratch_buf) {
-         struct fd_bo *scratch_bo = fd_resource(fd2_ctx->scratch_buf)->bo;
-         OUT_PKT3(ring, CP_EVENT_WRITE, 3);
-         OUT_RING(ring, CACHE_FLUSH_TS);
-         OUT_RELOC(ring, scratch_bo, 0, 0, 0); /* timestamp address */
-         OUT_RING(ring, ++fd2_ctx->cache_flush_seqno);
-      }
-      OUT_WFI(ring);
+      OUT_PKT3(ring, CP_EVENT_WRITE, 1);
+      OUT_RING(ring, CACHE_FLUSH);
+
+      OUT_PKT3(ring, CP_WAIT_REG_EQ, 4);
+      OUT_RING(ring, REG_A2XX_RBBM_DEBUG);  /* 0x39b */
+      OUT_RING(ring, 1u << 24);             /* expected: bit 24 set */
+      OUT_RING(ring, 1u << 24);             /* mask: only check bit 24 */
+      OUT_RING(ring, 1);                    /* 1 poll/iter */
    }
 
    OUT_PKT3(ring, CP_SET_CONSTANT, 2);
