@@ -823,7 +823,7 @@ fd_gmem_render_tiles(struct fd_batch *batch)
           */
          const unsigned pixels = pfb->width * pfb->height;
          if (batch->restore ||
-             (pixels >= 512 * 512 && batch->num_draws >= 10)) {
+             (pixels >= 512 * 512 && batch->num_draws >= 25)) {
             sysmem = true;
          }
       }
