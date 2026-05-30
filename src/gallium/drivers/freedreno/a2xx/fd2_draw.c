@@ -494,6 +494,22 @@ fd2_clear_fast(struct fd_context *ctx, unsigned buffers,
    if (!is_a2xx(ctx->screen))
       return false;
 
+   /*
+    * The HW fast-clear emits a GMEM-style RB_SURFACE_INFO/RB_COLOR_INFO/
+    * RB_DEPTH_INFO triple (PITCH=32, COLORX_4_4_4_4, DEPTHX_16, BASE=0) to
+    * configure the fast-clear shader's tiny EDRAM target. That clobbers the
+    * sysmem framebuffer state set up by fd2_emit_sysmem_prep, leaving the
+    * actual user draws targeting garbage at iova 0 for depth/color -- visible
+    * as random missing geometry and --validate failures on every depth-tested
+    * scene in sysmem mode. Upstream's design (per the comment above) was that
+    * clear forces GMEM rendering; the FD_DBG(SYSMEM) path bypasses that, so
+    * we have to bail out here and let the slow-clear (fullscreen quad draw)
+    * run instead -- which uses the correct sysmem state from fd2_emit_state
+    * and clears via a normal draw without touching surface-info regs.
+    */
+   if (FD_DBG(SYSMEM))
+      return false;
+
    if (buffers & PIPE_CLEAR_COLOR)
       color_size = util_format_get_blocksizebits(format) == 32;
 
