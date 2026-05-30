@@ -23,6 +23,7 @@
 #include "freedreno_gmem.h"
 #include "freedreno_query_hw.h"
 #include "freedreno_resource.h"
+#include "freedreno_screen.h"
 #include "freedreno_tracepoints.h"
 #include "freedreno_util.h"
 
@@ -779,6 +780,52 @@ fd_gmem_render_tiles(struct fd_batch *batch)
       /* For ARB_framebuffer_no_attachments: */
       if ((pfb->nr_cbufs == 0) && !pfb->zsbuf.texture) {
          sysmem = true;
+      }
+
+      /* A22X (Adreno 220/225) GMEM-deadlock heuristic:
+       *
+       * On A22X the EDRAM back-end deadlocks (RBBM_STATUS=0xc4010310, all of
+       * GUI+RB+VGT+CP_NRT busy + CP cmd FIFO 1/16 free, no progress) for two
+       * classes of GMEM-tile batches:
+       *
+       *   (a) FBO read-back patterns -- blur ping-pong, refraction, etc. --
+       *       indicated by batch->restore != 0 (some attachment is restored
+       *       from sysmem at tile-load because it was not fully cleared by
+       *       this batch).
+       *   (b) High aggregate work batches on multi-tile FBOs -- shadow
+       *       mapping, complex scenes -- where num_draws across many tiles
+       *       saturates the EDRAM back-end pipeline. Empirically a
+       *       1024x768 batch with >=10 draws is sufficient to hit it.
+       *
+       * Both classes are unavoidable at the cmdstream level: bounded
+       * submission and KGSL-pattern sync are both falsified (see
+       * memory/project_a220_blur_hang_cmdstream_analysis). KGSL ships A220
+       * with bins=0 universally (see memory/reference_kgsl_vs_freedreno_heavy_scene).
+       *
+       * Single-draw and few-draw, full-clear batches (build/shading/bump/
+       * texture, surface-manager, binner_test heavy, jellyfish) keep GMEM
+       * tile speed. !FD_DBG(GMEM) so users can force GMEM for debug.
+       *
+       * Validated 2026-05-30:
+       *   jellyfish (1024x768, num_draws=2):                GMEM, 12 fps
+       *   glmark2 build/shading/bump (num_draws=1):         GMEM, Success
+       *   binner_test heavy (256x256 batches, num_draws=1): GMEM
+       *   glmark2 desktop:blur w=4 (1024x768, restore=0x4): sysmem, 21 fps
+       *   glmark2 desktop:shadow w=4 (1024x768, num_draws=25-50): sysmem
+       */
+      if (is_a22x(ctx->screen) && !FD_DBG(GMEM)) {
+         /* Triggers if either:
+          *  - the batch reads its own FBO contents back (multi-pass), OR
+          *  - it has a lot of draws on a framebuffer big enough to need
+          *    multiple GMEM tiles (cumulative back-end pressure).
+          *
+          * 512*512 ~ 2 tiles on A220's 512KB GMEM (32bpp color + depth).
+          */
+         const unsigned pixels = pfb->width * pfb->height;
+         if (batch->restore ||
+             (pixels >= 512 * 512 && batch->num_draws >= 10)) {
+            sysmem = true;
+         }
       }
    }
 
