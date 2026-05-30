@@ -507,6 +507,28 @@ fd2_emit_sysmem_prep(struct fd_batch *batch)
                 A2XX_RB_COLOR_INFO_FORMAT(fd2_pipe2color(psurf->format)),
              0);
 
+   /* Emit RB_DEPTH_INFO with the depth buffer's iova + format. Without this,
+    * the depth register is left at default DEPTHX_16+BASE=0, depth-test reads
+    * garbage at iova 0, and geometry gets randomly z-rejected -> visible
+    * corruption (--validate fails on every scene with a depth buffer in
+    * sysmem mode, while the SAME scenes pass under GMEM where the per-tile
+    * RB_DEPTH_INFO emit in fd2_emit_tile_renderprep configures the depth
+    * correctly). GMEM-side depth-info emit at line ~656 was always present;
+    * the sysmem-side equivalent was missing.
+    */
+   if (pfb->zsbuf.texture) {
+      struct pipe_surface *zsurf = &pfb->zsbuf;
+      struct fd_resource *zrsc = fd_resource(zsurf->texture);
+      uint32_t zoffset =
+         fd_resource_offset(zrsc, zsurf->level, zsurf->first_layer);
+
+      OUT_PKT3(ring, CP_SET_CONSTANT, 2);
+      OUT_RING(ring, CP_REG(REG_A2XX_RB_DEPTH_INFO));
+      OUT_RELOC(ring, zrsc->bo, zoffset,
+                A2XX_RB_DEPTH_INFO_DEPTH_FORMAT(fd_pipe2depth(zsurf->format)),
+                0);
+   }
+
    OUT_PKT3(ring, CP_SET_CONSTANT, 3);
    OUT_RING(ring, CP_REG(REG_A2XX_PA_SC_SCREEN_SCISSOR_TL));
    OUT_RING(ring, A2XX_PA_SC_SCREEN_SCISSOR_TL_WINDOW_OFFSET_DISABLE);
